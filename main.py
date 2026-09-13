@@ -16,8 +16,10 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     PicklePersistence,
+    filters,
 )
 
 # --- Détection du système d'exploitation ---
@@ -68,6 +70,17 @@ _raw_allowed = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS = {
     int(x.strip()) for x in _raw_allowed.split(",") if x.strip().lstrip("-").isdigit()
 }
+
+# --- Administrateur (relais des messages + broadcast) ---
+# Le chat_id qui recevra les messages des visiteurs et pourra utiliser /broadcast.
+# Si non défini mais qu'un seul ALLOWED_CHAT_IDS est configuré, celui-ci est utilisé automatiquement.
+_admin_env = os.getenv("ADMIN_CHAT_ID", "").strip()
+if _admin_env.lstrip("-").isdigit():
+    ADMIN_CHAT_ID = int(_admin_env)
+elif len(ALLOWED_CHAT_IDS) == 1:
+    ADMIN_CHAT_ID = next(iter(ALLOWED_CHAT_IDS))
+else:
+    ADMIN_CHAT_ID = None
 
 # --- Reset quotidien automatique (optionnel) ---
 DAILY_RESET_ENABLED = os.getenv("DAILY_RESET_ENABLED", "false").lower() == "true"
@@ -163,6 +176,17 @@ def is_authorized(chat_id: int) -> bool:
     if not ALLOWED_CHAT_IDS:
         return True
     return chat_id in ALLOWED_CHAT_IDS
+
+
+def is_admin(chat_id: int) -> bool:
+    """Vérifie si le chat_id est celui de l'administrateur configuré."""
+    return ADMIN_CHAT_ID is not None and chat_id == ADMIN_CHAT_ID
+
+
+def remember_known_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Ajoute ce chat_id à la liste des utilisateurs connus, pour permettre le /broadcast."""
+    known = context.bot_data.setdefault('known_users', set())
+    known.add(chat_id)
 
 
 def remember_broadcast(context: ContextTypes.DEFAULT_TYPE, *, kind: str, text: str = None,
@@ -646,6 +670,7 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /start : affiche le menu principal (ne réinitialise rien)."""
     chat_id = update.effective_chat.id
+    remember_known_user(context, chat_id)
     if not is_authorized(chat_id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
@@ -665,6 +690,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>ℹ️ AIDE</b>\n\n"
         "/start — Menu principal (session gratuite / VIP)\n"
         "/stats — Statistiques détaillées (taux de réussite, meilleur/pire actif)\n"
+        "/broadcast <message> — (admin) Envoie un message à tous les utilisateurs connus\n"
         "/help — Affiche ce message\n\n"
         "🆓 <b>SESSION GRATUITE</b> — signaux + bilan classique\n"
         "👑 <b>SESSION VIP</b> — 4 sous-sessions (matin/midi/soir/nuit), accessibles librement, "
@@ -842,6 +868,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     data = query.data
     chat_id = update.effective_chat.id
+    remember_known_user(context, chat_id)
 
     if not is_authorized(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="⛔ Accès non autorisé.")
@@ -1113,6 +1140,91 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 remember_broadcast(context, kind='text', text=caption_text, parse_mode="HTML")
 
 
+async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Relais des messages texte libres :
+    - Si un visiteur écrit au bot, son message est transféré à l'administrateur.
+    - Si l'administrateur répond (fonction "Répondre" de Telegram) à un message transféré,
+      cette réponse est renvoyée automatiquement au visiteur d'origine.
+    """
+    message = update.message
+    if message is None or not message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    remember_known_user(context, chat_id)
+
+    if ADMIN_CHAT_ID is None:
+        return  # Fonctionnalité non configurée (ADMIN_CHAT_ID absent du .env)
+
+    if is_admin(chat_id):
+        reply_to = message.reply_to_message
+        if reply_to:
+            relay_map = context.bot_data.get('relay_map', {})
+            target_chat_id = relay_map.get(reply_to.message_id)
+            if target_chat_id:
+                try:
+                    await context.bot.send_message(chat_id=target_chat_id, text=message.text)
+                    await message.reply_text("✅ Réponse envoyée.")
+                except Exception as e:
+                    await message.reply_text(f"❌ Échec de l'envoi : {e}")
+                return
+        # Message de l'admin qui n'est pas une réponse à un visiteur : on l'ignore simplement.
+        return
+
+    # --- Message venant d'un visiteur : on le relaie à l'administrateur ---
+    sender = update.effective_user
+    sender_name = sender.full_name if sender else "Inconnu"
+    username = f"@{sender.username}" if sender and sender.username else "(pas de pseudo)"
+
+    try:
+        forwarded = await context.bot.forward_message(
+            chat_id=ADMIN_CHAT_ID,
+            from_chat_id=chat_id,
+            message_id=message.message_id,
+        )
+        note = await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"☝️ Message de {sender_name} {username} (id: {chat_id})\nRéponds à ce message pour lui répondre.",
+            reply_to_message_id=forwarded.message_id,
+        )
+        relay_map = context.bot_data.setdefault('relay_map', {})
+        relay_map[forwarded.message_id] = chat_id
+        relay_map[note.message_id] = chat_id
+    except Exception as e:
+        logger.warning(f"Échec de relais du message de {chat_id} : {e}")
+        return
+
+    await message.reply_text("✅ Message reçu, réponse à venir.")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /broadcast <message> : envoie un message à tous les utilisateurs connus (admin uniquement)."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Réservé à l'administrateur.")
+        return
+
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text("Usage : /broadcast <message>")
+        return
+
+    known_users = context.bot_data.get('known_users', set())
+    sent, failed = 0, 0
+    for uid in known_users:
+        if uid == ADMIN_CHAT_ID:
+            continue
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Échec de diffusion à {uid} : {e}")
+            failed += 1
+
+    await update.message.reply_text(f"📢 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log des erreurs rencontrées."""
     logger.error("Exception rencontrée lors du traitement d'une mise à jour :", exc_info=context.error)
@@ -1150,7 +1262,9 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(handle_button_click))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_incoming_message))
 
     # Gestionnaire d'erreurs
     app.add_error_handler(error_handler)
@@ -1175,6 +1289,14 @@ def main():
         logger.info(f"Accès restreint à {len(ALLOWED_CHAT_IDS)} chat_id(s).")
     else:
         logger.info("Aucune restriction d'accès configurée (ALLOWED_CHAT_IDS vide).")
+
+    if ADMIN_CHAT_ID is not None:
+        logger.info(f"Relais des messages activé vers l'administrateur (chat_id={ADMIN_CHAT_ID}).")
+    else:
+        logger.warning(
+            "ADMIN_CHAT_ID non configuré : les messages reçus des visiteurs ne seront pas relayés. "
+            "Ajoute ADMIN_CHAT_ID dans le .env pour activer cette fonctionnalité."
+        )
 
     logger.info("Bot prêt et démarré !")
 
