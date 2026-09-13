@@ -417,16 +417,17 @@ def get_free_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_signal_keyboard() -> InlineKeyboardMarkup:
-    """Boutons SIGNAL, BILAN, ANNULER et DIFFUSER (session gratuite)."""
+def get_signal_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
+    """Boutons SIGNAL, BILAN, ANNULER (optionnel) et DIFFUSER (session gratuite)."""
     keyboard = [
         [
             InlineKeyboardButton("SIGNAL", callback_data="btn_get_signal"),
             InlineKeyboardButton("BILAN", callback_data="btn_bilan"),
         ],
-        [InlineKeyboardButton("↩️ ANNULER DERNIER", callback_data="btn_undo")],
-        [InlineKeyboardButton("📤 DIFFUSER", callback_data="btn_broadcast_menu")],
     ]
+    if include_undo:
+        keyboard.append([InlineKeyboardButton("↩️ ANNULER DERNIER", callback_data="btn_undo")])
+    keyboard.append([InlineKeyboardButton("📤 DIFFUSER", callback_data="btn_broadcast_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -484,17 +485,18 @@ def get_vip_signal_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_vip_result_keyboard() -> InlineKeyboardMarkup:
-    """Boutons SIGNAL / BILAN / ANNULER / DIFFUSER / MENU VIP, affichés après un résultat en session VIP."""
+def get_vip_result_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
+    """Boutons SIGNAL / BILAN / ANNULER (optionnel) / DIFFUSER / MENU VIP, après un résultat en session VIP."""
     keyboard = [
         [
             InlineKeyboardButton("SIGNAL", callback_data="btn_get_signal"),
             InlineKeyboardButton("BILAN", callback_data="btn_bilan"),
         ],
-        [InlineKeyboardButton("↩️ ANNULER DERNIER", callback_data="btn_undo")],
-        [InlineKeyboardButton("📤 DIFFUSER", callback_data="btn_broadcast_menu")],
-        [InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")],
     ]
+    if include_undo:
+        keyboard.append([InlineKeyboardButton("↩️ ANNULER DERNIER", callback_data="btn_undo")])
+    keyboard.append([InlineKeyboardButton("📤 DIFFUSER", callback_data="btn_broadcast_menu")])
+    keyboard.append([InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -527,6 +529,16 @@ def get_broadcast_targets_keyboard() -> InlineKeyboardMarkup:
         keyboard.append([InlineKeyboardButton("📤 ENVOYER À TOUS", callback_data="bcast_all")])
     keyboard.append([InlineKeyboardButton("❌ Annuler", callback_data="bcast_cancel")])
     return InlineKeyboardMarkup(keyboard)
+
+
+async def delete_message_safe(bot, chat_id, message_id) -> bool:
+    """Tente de supprimer un message (chat privé, groupe ou canal). N'échoue jamais bruyamment."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as e:
+        logger.warning(f"Impossible de supprimer le message {message_id} dans {chat_id} : {e}")
+        return False
 
 
 async def send_photo_safe(bot, chat_id, image_path, caption, reply_markup, parse_mode=None):
@@ -575,6 +587,7 @@ async def start_free_session(chat_id, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['history'] = []
     context.user_data['last_signal'] = None
     context.user_data['last_signal_message'] = None
+    context.user_data['current_trade'] = None
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -593,6 +606,7 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
         context.user_data['vip_history'][session_key] = []
     context.user_data['last_signal'] = None
     context.user_data['last_signal_message'] = None
+    context.user_data['current_trade'] = None
 
     icon, label = VIP_SESSION_LABELS[session_key]
     prefix = "🔄 Session réinitialisée.\n\n" if reset else ""
@@ -664,6 +678,8 @@ async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
         data['vip_history'] = empty_vip_history()
         data['last_signal'] = None
         data['last_signal_message'] = None
+        data['current_trade'] = None
+        data['last_broadcast'] = None
         count += 1
     logger.info(f"Réinitialisation quotidienne effectuée pour {count} utilisateur(s).")
 
@@ -693,6 +709,13 @@ async def send_signal_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Mémorise le message envoyé pour pouvoir le supprimer si NEW est cliqué
     if sent_message:
         context.user_data['last_signal_message'] = (chat_id, sent_message.message_id)
+
+        # Nouveau "trade" en cours : réinitialise le suivi pour ANNULER DERNIER
+        context.user_data['current_trade'] = {
+            'signal_message': (chat_id, sent_message.message_id),
+            'result_message': None,
+            'broadcasts': [],
+        }
 
         if sent_message.photo:
             remember_broadcast(
@@ -873,16 +896,40 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             session_key = context.user_data.get('vip_current')
             vip_history = context.user_data.setdefault('vip_history', empty_vip_history())
             entries = vip_history.get(session_key, [])
-            reply_markup = get_vip_result_keyboard()
         else:
             entries = context.user_data.setdefault('history', [])
-            reply_markup = get_signal_keyboard()
 
-        if entries:
-            removed = entries.pop()
-            text = f"↩️ Dernier résultat annulé :\n{removed['actif']} • {removed['direction']}"
-        else:
-            text = "Aucun résultat à annuler pour le moment."
+        if not entries:
+            reply_markup = get_vip_result_keyboard() if mode == 'vip' else get_signal_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Aucun résultat à annuler pour le moment.",
+                reply_markup=reply_markup,
+            )
+            return
+
+        removed = entries.pop()
+
+        # Supprime le signal, le résultat et toutes leurs copies diffusées (canaux/groupes)
+        trade = context.user_data.get('current_trade') or {}
+
+        if trade.get('signal_message'):
+            s_chat, s_id = trade['signal_message']
+            await delete_message_safe(context.bot, s_chat, s_id)
+
+        if trade.get('result_message'):
+            r_chat, r_id = trade['result_message']
+            await delete_message_safe(context.bot, r_chat, r_id)
+
+        for b_chat, b_id in trade.get('broadcasts', []):
+            await delete_message_safe(context.bot, b_chat, b_id)
+
+        # Trade entièrement annulé : plus rien à annuler tant qu'un nouveau signal n'est pas généré
+        context.user_data['current_trade'] = None
+        context.user_data['last_broadcast'] = None
+
+        text = f"↩️ Dernier résultat annulé :\n{removed['actif']} • {removed['direction']}"
+        reply_markup = get_vip_result_keyboard(include_undo=False) if mode == 'vip' else get_signal_keyboard(include_undo=False)
 
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         return
@@ -934,20 +981,25 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             dest = normalize_broadcast_target(target)
             try:
                 if content['kind'] == 'photo' and content.get('photo_file_id'):
-                    await context.bot.send_photo(
+                    sent = await context.bot.send_photo(
                         chat_id=dest,
                         photo=content['photo_file_id'],
                         caption=content.get('text'),
                         parse_mode=content.get('parse_mode'),
                     )
                 else:
-                    await context.bot.send_message(
+                    sent = await context.bot.send_message(
                         chat_id=dest,
                         text=content.get('text') or '',
                         parse_mode=content.get('parse_mode'),
                         disable_web_page_preview=True,
                     )
                 results.append(f"✅ {target}")
+
+                # Mémorise cette copie pour pouvoir la supprimer via ANNULER DERNIER
+                trade = context.user_data.get('current_trade')
+                if trade is not None:
+                    trade.setdefault('broadcasts', []).append((sent.chat_id, sent.message_id))
             except Exception as e:
                 logger.warning(f"Échec de diffusion vers {target} : {e}")
                 results.append(f"❌ {target} — {e}")
@@ -988,6 +1040,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         if sent_message:
+            trade = context.user_data.get('current_trade') or {}
+            trade['result_message'] = (chat_id, sent_message.message_id)
+            context.user_data['current_trade'] = trade
             if sent_message.photo:
                 remember_broadcast(context, kind='photo', text=caption_text,
                                     photo_file_id=sent_message.photo[-1].file_id, parse_mode="HTML")
@@ -1015,6 +1070,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         if sent_message:
+            trade = context.user_data.get('current_trade') or {}
+            trade['result_message'] = (chat_id, sent_message.message_id)
+            context.user_data['current_trade'] = trade
             if sent_message.photo:
                 remember_broadcast(context, kind='photo', text=caption_text,
                                     photo_file_id=sent_message.photo[-1].file_id, parse_mode="HTML")
