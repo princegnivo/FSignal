@@ -83,6 +83,12 @@ elif len(ALLOWED_CHAT_IDS) == 1:
 else:
     ADMIN_CHAT_ID = None
 
+# --- Groupe de support avec Topics (fil de discussion par visiteur, optionnel) ---
+# ID du supergroupe (négatif) où les Topics/Sujets sont activés. Le bot doit y être admin
+# avec le droit "Gérer les sujets". Si non configuré, le relais se fait en message privé simple.
+_support_group_env = os.getenv("SUPPORT_GROUP_ID", "").strip()
+SUPPORT_GROUP_ID = int(_support_group_env) if _support_group_env.lstrip("-").isdigit() else None
+
 # --- Reset quotidien automatique (optionnel) ---
 DAILY_RESET_ENABLED = os.getenv("DAILY_RESET_ENABLED", "false").lower() == "true"
 DAILY_RESET_HOUR = int(os.getenv("DAILY_RESET_HOUR", "0"))
@@ -191,6 +197,58 @@ def remember_known_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Ajoute ce chat_id à la liste des utilisateurs connus, pour permettre le /broadcast."""
     known = context.bot_data.setdefault('known_users', set())
     known.add(chat_id)
+
+
+def log_conversation(context: ContextTypes.DEFAULT_TYPE, visitor_chat_id: int, sender: str, text: str):
+    """Enregistre un message échangé avec un visiteur (pour la commande /historique)."""
+    log = context.bot_data.setdefault('conversation_log', {})
+    entries = log.setdefault(visitor_chat_id, [])
+    entries.append({
+        'from': sender,  # 'visitor' ou 'admin'
+        'text': text,
+        'time': datetime.now(TZ),
+    })
+    # Limite pour éviter une croissance illimitée de la mémoire
+    if len(entries) > 200:
+        del entries[:len(entries) - 200]
+
+
+async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                               sender_name: str, username: str):
+    """
+    Retourne le message_thread_id du topic dédié à ce visiteur dans le groupe de support,
+    en le créant s'il n'existe pas encore. Retourne None si SUPPORT_GROUP_ID n'est pas
+    configuré ou si la création échoue (groupe sans Topics activés, bot non admin, etc.).
+    """
+    if SUPPORT_GROUP_ID is None:
+        return None
+
+    topics = context.bot_data.setdefault('visitor_topics', {})
+    if chat_id in topics:
+        return topics[chat_id]
+
+    topic_name = (sender_name or f"Visiteur {chat_id}").strip()[:100]
+    try:
+        topic = await context.bot.create_forum_topic(chat_id=SUPPORT_GROUP_ID, name=topic_name)
+    except Exception as e:
+        logger.warning(f"Impossible de créer un topic pour {chat_id} ({sender_name}) : {e}")
+        return None
+
+    thread_id = topic.message_thread_id
+    topics[chat_id] = thread_id
+    reverse = context.bot_data.setdefault('topic_to_visitor', {})
+    reverse[thread_id] = chat_id
+
+    try:
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=thread_id,
+            text=f"🆕 Conversation avec {sender_name} {username} (id: {chat_id})",
+        )
+    except Exception as e:
+        logger.warning(f"Impossible d'envoyer le message d'intro du topic {thread_id} : {e}")
+
+    return thread_id
 
 
 def remember_broadcast(context: ContextTypes.DEFAULT_TYPE, *, kind: str, text: str = None,
@@ -687,13 +745,13 @@ async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, fir
     await context.bot.send_message(chat_id=chat_id, text=text1, parse_mode="HTML")
 
     text2 = (
-        "Envoie-moi ton message et je te réponds <b>le plus tôt possible</b> ⏱️\n\n"
+        "Envoyez-moi votre message et je vous réponds <b>le plus tôt possible</b> ⏱️\n\n"
         "<b>📝 INSCRIPTION</b>\n"
         f"Pour rejoindre le <b>VIP</b>, vous devez vous inscrire sur "
-        f"<a href=\"{POCKET_OPTION_LINK}\">PocketOption</a>.\n"
-        f"Crée un nouveau compte (<b>BONUS DE 30%</b>), et après avoir terminé l'inscription\n\n"
-        f"❗️<b>ENVOIE TON ID</b> depuis votre compte "
-        f"<a href=\"{POCKET_OPTION_LINK}\">PocketOption</a> ici\n"
+        f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a>.\n"
+        f"Créez un nouveau compte (<b>BONUS DE 30%</b>), et après avoir terminé l'inscription\n\n"
+        f"❗️<b>ENVOYEZ VOTRE ID</b> depuis votre compte "
+        f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a> ici\n"
         "______________________"
     )
     await context.bot.send_message(chat_id=chat_id, text=text2, parse_mode="HTML")
@@ -727,6 +785,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — Menu principal (session gratuite / VIP)\n"
         "/stats — Statistiques détaillées (taux de réussite, meilleur/pire actif)\n"
         "/broadcast <message> — (admin) Envoie un message à tous les utilisateurs connus\n"
+        "/historique <chat_id> — (admin) Affiche l'échange enregistré avec ce visiteur\n"
         "/help — Affiche ce message\n\n"
         "🆓 <b>SESSION GRATUITE</b> — signaux + bilan classique\n"
         "👑 <b>SESSION VIP</b> — 4 sous-sessions (matin/midi/soir/nuit), accessibles librement, "
@@ -1178,21 +1237,52 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Relais des messages texte libres :
-    - Si un visiteur écrit au bot, son message est transféré à l'administrateur.
-    - Si l'administrateur répond (fonction "Répondre" de Telegram) à un message transféré,
-      cette réponse est renvoyée automatiquement au visiteur d'origine.
+    Relais des messages texte libres, avec deux mécanismes possibles :
+
+    1) Groupe de support avec Topics (si SUPPORT_GROUP_ID configuré) : chaque visiteur a son
+       propre fil de discussion. Tout message envoyé dans ce fil (par un admin/membre du
+       groupe) est renvoyé au visiteur correspondant. C'est le mode prioritaire.
+
+    2) Mode direct (si seul ADMIN_CHAT_ID est configuré) : les messages des visiteurs sont
+       transférés au chat privé de l'admin, qui répond via "Répondre" (reply) sur le message.
+
+    Dans tous les cas, chaque échange est aussi journalisé pour la commande /historique.
     """
     message = update.message
     if message is None or not message.text:
         return
 
     chat_id = update.effective_chat.id
+
+    # --- Cas 1 : message envoyé DANS le groupe de support (dans un topic donné) ---
+    if SUPPORT_GROUP_ID is not None and chat_id == SUPPORT_GROUP_ID:
+        thread_id = message.message_thread_id
+        if thread_id is None:
+            return  # message hors sujet (fil général du groupe) : on ignore
+
+        # Ignore les messages qui sont eux-mêmes des transferts (l'écho du message du visiteur)
+        is_forward = bool(getattr(message, 'forward_origin', None) or getattr(message, 'forward_date', None))
+        if is_forward:
+            return
+
+        reverse = context.bot_data.get('topic_to_visitor', {})
+        target_chat_id = reverse.get(thread_id)
+        if not target_chat_id:
+            return
+
+        try:
+            await context.bot.send_message(chat_id=target_chat_id, text=message.text)
+            log_conversation(context, target_chat_id, 'admin', message.text)
+        except Exception as e:
+            await message.reply_text(f"❌ Échec de l'envoi : {e}")
+        return
+
     remember_known_user(context, chat_id)
 
-    if ADMIN_CHAT_ID is None:
-        return  # Fonctionnalité non configurée (ADMIN_CHAT_ID absent du .env)
+    if ADMIN_CHAT_ID is None and SUPPORT_GROUP_ID is None:
+        return  # Aucune des deux fonctionnalités n'est configurée
 
+    # --- Cas 2 : l'admin écrit en privé au bot (mode direct, sans groupe) ---
     if is_admin(chat_id):
         reply_to = message.reply_to_message
         if reply_to:
@@ -1201,6 +1291,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             if target_chat_id:
                 try:
                     await context.bot.send_message(chat_id=target_chat_id, text=message.text)
+                    log_conversation(context, target_chat_id, 'admin', message.text)
                     await message.reply_text("✅ Réponse envoyée.")
                 except Exception as e:
                     await message.reply_text(f"❌ Échec de l'envoi : {e}")
@@ -1208,30 +1299,48 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
         # Message de l'admin qui n'est pas une réponse à un visiteur : on l'ignore simplement.
         return
 
-    # --- Message venant d'un visiteur : on le relaie à l'administrateur ---
+    # --- Cas 3 : message venant d'un visiteur ---
     sender = update.effective_user
     sender_name = sender.full_name if sender else "Inconnu"
     username = f"@{sender.username}" if sender and sender.username else "(pas de pseudo)"
 
-    try:
-        forwarded = await context.bot.forward_message(
-            chat_id=ADMIN_CHAT_ID,
-            from_chat_id=chat_id,
-            message_id=message.message_id,
-        )
-        note = await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"☝️ Message de {sender_name} {username} (id: {chat_id})\nRéponds à ce message pour lui répondre.",
-            reply_to_message_id=forwarded.message_id,
-        )
-        relay_map = context.bot_data.setdefault('relay_map', {})
-        relay_map[forwarded.message_id] = chat_id
-        relay_map[note.message_id] = chat_id
-    except Exception as e:
-        logger.warning(f"Échec de relais du message de {chat_id} : {e}")
-        return
+    log_conversation(context, chat_id, 'visitor', message.text)
 
-    await message.reply_text("✅ Message reçu, réponse à venir.")
+    # Priorité au groupe avec Topics s'il est configuré et fonctionnel
+    if SUPPORT_GROUP_ID is not None:
+        thread_id = await get_or_create_topic(context, chat_id, sender_name, username)
+        if thread_id is not None:
+            try:
+                await context.bot.forward_message(
+                    chat_id=SUPPORT_GROUP_ID,
+                    from_chat_id=chat_id,
+                    message_id=message.message_id,
+                    message_thread_id=thread_id,
+                )
+            except Exception as e:
+                logger.warning(f"Échec de relais (topic) du message de {chat_id} : {e}")
+            return
+        # Si la création/récupération du topic échoue, on retombe sur le mode direct ci-dessous
+
+    # Repli : mode direct vers le chat privé de l'admin
+    if ADMIN_CHAT_ID is not None:
+        try:
+            forwarded = await context.bot.forward_message(
+                chat_id=ADMIN_CHAT_ID,
+                from_chat_id=chat_id,
+                message_id=message.message_id,
+            )
+            note = await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"☝️ Message de {sender_name} {username} (id: {chat_id})\nRéponds à ce message pour lui répondre.",
+                reply_to_message_id=forwarded.message_id,
+            )
+            relay_map = context.bot_data.setdefault('relay_map', {})
+            relay_map[forwarded.message_id] = chat_id
+            relay_map[note.message_id] = chat_id
+        except Exception as e:
+            logger.warning(f"Échec de relais du message de {chat_id} : {e}")
+            return
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1259,6 +1368,46 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
 
     await update.message.reply_text(f"📢 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).")
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /historique <chat_id> : affiche tout l'échange enregistré avec ce visiteur."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Réservé à l'administrateur.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage : /historique <chat_id>\n"
+            "L'id du visiteur est indiqué dans le nom du topic ou dans le message de relais."
+        )
+        return
+
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id invalide (doit être un nombre).")
+        return
+
+    log = context.bot_data.get('conversation_log', {})
+    entries = log.get(target, [])
+    if not entries:
+        await update.message.reply_text("Aucun échange enregistré avec ce chat_id.")
+        return
+
+    lines = []
+    for entry in entries:
+        who = "🧑 Visiteur" if entry['from'] == 'visitor' else "🧔 Toi"
+        time_str = entry['time'].strftime('%d/%m %H:%M')
+        lines.append(f"[{time_str}] {who} : {entry['text']}")
+
+    full_text = f"🗂️ Historique avec {target} :\n\n" + "\n".join(lines)
+
+    # Découpage si le texte dépasse la limite d'un message Telegram
+    max_len = 3500
+    for i in range(0, len(full_text), max_len):
+        await update.message.reply_text(full_text[i:i + max_len])
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1299,6 +1448,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("historique", history_command))
     app.add_handler(CallbackQueryHandler(handle_button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_incoming_message))
 
@@ -1333,6 +1483,11 @@ def main():
             "ADMIN_CHAT_ID non configuré : les messages reçus des visiteurs ne seront pas relayés. "
             "Ajoute ADMIN_CHAT_ID dans le .env pour activer cette fonctionnalité."
         )
+
+    if SUPPORT_GROUP_ID is not None:
+        logger.info(f"Groupe de support avec Topics activé (chat_id={SUPPORT_GROUP_ID}).")
+    else:
+        logger.info("SUPPORT_GROUP_ID non configuré : relais en mode direct uniquement.")
 
     logger.info("Bot prêt et démarré !")
 
