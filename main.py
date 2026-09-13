@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import platform
 import random
 import logging
 from collections import defaultdict
@@ -8,6 +10,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,6 +19,19 @@ from telegram.ext import (
     ContextTypes,
     PicklePersistence,
 )
+
+# --- Détection du système d'exploitation ---
+# Le bot fonctionne sur Windows, macOS, Linux et Termux (Android) sans configuration
+# manuelle. Sous Windows, la console n'utilise pas UTF-8 par défaut : sans ce correctif,
+# les accents et emojis dans les logs peuvent provoquer une UnicodeEncodeError.
+SYSTEM_OS = platform.system()  # 'Windows', 'Darwin' (macOS), 'Linux' (dont Termux)
+
+if SYSTEM_OS == "Windows":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -55,6 +72,10 @@ ALLOWED_CHAT_IDS = {
 # --- Reset quotidien automatique (optionnel) ---
 DAILY_RESET_ENABLED = os.getenv("DAILY_RESET_ENABLED", "false").lower() == "true"
 DAILY_RESET_HOUR = int(os.getenv("DAILY_RESET_HOUR", "0"))
+
+# --- Timeouts réseau (utile sur connexion lente/instable, ex: données mobiles) ---
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "20"))
+READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "20"))
 
 # Dossiers d'images
 DIR_IMG = "IMG"
@@ -867,7 +888,28 @@ def main():
         raise ValueError("Le TELEGRAM_TOKEN n'a pas été trouvé. Vérifiez votre fichier .env")
 
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
-    app = Application.builder().token(TOKEN).persistence(persistence).build()
+
+    # Requêtes API avec timeouts généreux (utile sur connexion mobile lente/instable)
+    api_request = HTTPXRequest(
+        connect_timeout=CONNECT_TIMEOUT,
+        read_timeout=READ_TIMEOUT,
+        write_timeout=CONNECT_TIMEOUT,
+        pool_timeout=CONNECT_TIMEOUT,
+    )
+    # Le long polling (get_updates) garde la connexion ouverte plus longtemps : lecture élargie
+    polling_request = HTTPXRequest(
+        connect_timeout=CONNECT_TIMEOUT,
+        read_timeout=READ_TIMEOUT + 10,
+    )
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .persistence(persistence)
+        .request(api_request)
+        .get_updates_request(polling_request)
+        .build()
+    )
 
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -892,6 +934,7 @@ def main():
             )
             logger.info(f"Reset quotidien programmé à {DAILY_RESET_HOUR:02d}:00 ({TIMEZONE_NAME}).")
 
+    logger.info(f"Système détecté : {SYSTEM_OS} (Python {platform.python_version()})")
     logger.info(f"Persistance activée : {PERSISTENCE_FILE}")
     if ALLOWED_CHAT_IDS:
         logger.info(f"Accès restreint à {len(ALLOWED_CHAT_IDS)} chat_id(s).")
@@ -899,7 +942,18 @@ def main():
         logger.info("Aucune restriction d'accès configurée (ALLOWED_CHAT_IDS vide).")
 
     logger.info("Bot prêt et démarré !")
-    app.run_polling()
+
+    try:
+        app.run_polling()
+    except (NetworkError, TimedOut) as e:
+        logger.error(
+            "Impossible de contacter Telegram (api.telegram.org). Vérifiez : "
+            "1) votre connexion internet, 2) qu'un VPN n'est pas nécessaire "
+            "(Telegram est bloqué dans certains pays/réseaux), 3) qu'aucun pare-feu "
+            f"ne bloque l'application. Détail technique : {e}"
+        )
+    except KeyboardInterrupt:
+        logger.info("Arrêt du bot demandé par l'utilisateur.")
 
 
 if __name__ == "__main__":
