@@ -541,6 +541,32 @@ async def delete_message_safe(bot, chat_id, message_id) -> bool:
         return False
 
 
+async def send_transient(context: ContextTypes.DEFAULT_TYPE, chat_id, text, reply_markup=None, parse_mode=None):
+    """
+    Envoie un message de navigation/confirmation "de passage" (menus, invites, accusés de
+    diffusion ou d'annulation). Contrairement aux signaux, résultats et bilans, ces messages
+    ne sont pas destinés à rester dans le chat : ils sont automatiquement supprimés dès que
+    l'utilisateur appuie sur un bouton suivant (voir clear_last_transient).
+    """
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+    context.user_data['last_transient_message'] = (chat_id, sent.message_id)
+    return sent
+
+
+async def clear_last_transient(context: ContextTypes.DEFAULT_TYPE):
+    """Supprime le dernier message 'de passage' encore affiché, avant de traiter une nouvelle action."""
+    transient = context.user_data.pop('last_transient_message', None)
+    if transient:
+        t_chat, t_id = transient
+        await delete_message_safe(context.bot, t_chat, t_id)
+
+
 async def send_photo_safe(bot, chat_id, image_path, caption, reply_markup, parse_mode=None):
     """
     Tente d'envoyer une photo. Si Telegram refuse l'image (fichier corrompu,
@@ -574,8 +600,8 @@ async def send_photo_safe(bot, chat_id, image_path, caption, reply_markup, parse
 async def show_main_menu(chat_id, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu principal (choix entre session gratuite et session VIP).
     Ne réinitialise aucune donnée : sert uniquement de navigation."""
-    await context.bot.send_message(
-        chat_id=chat_id,
+    await send_transient(
+        context, chat_id,
         text="👇 Choisissez une option :",
         reply_markup=get_main_menu_keyboard()
     )
@@ -589,8 +615,8 @@ async def start_free_session(chat_id, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['last_signal_message'] = None
     context.user_data['current_trade'] = None
 
-    await context.bot.send_message(
-        chat_id=chat_id,
+    await send_transient(
+        context, chat_id,
         text="👇 Cliquez ci-dessous pour obtenir votre signal :",
         reply_markup=get_free_start_keyboard()
     )
@@ -610,8 +636,8 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
 
     icon, label = VIP_SESSION_LABELS[session_key]
     prefix = "🔄 Session réinitialisée.\n\n" if reset else ""
-    await context.bot.send_message(
-        chat_id=chat_id,
+    await send_transient(
+        context, chat_id,
         text=f"{prefix}👇 Session VIP - {icon} {label} : cliquez pour obtenir votre signal :",
         reply_markup=get_vip_signal_start_keyboard()
     )
@@ -623,6 +649,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(chat_id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
+    await clear_last_transient(context)
     await show_main_menu(chat_id, context)
 
 
@@ -632,6 +659,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(chat_id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
+    await clear_last_transient(context)
 
     text = (
         "<b>ℹ️ AIDE</b>\n\n"
@@ -654,6 +682,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(chat_id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
+    await clear_last_transient(context)
 
     history = context.user_data.get('history', [])
     vip_history = context.user_data.get('vip_history', empty_vip_history())
@@ -818,6 +847,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_message(chat_id=chat_id, text="⛔ Accès non autorisé.")
         return
 
+    # Nettoyage : le précédent message "de passage" (menu/confirmation) disparaît dès qu'on
+    # passe à l'action suivante. Seuls signaux, résultats et bilans restent dans le chat.
+    await clear_last_transient(context)
+
     # --- Navigation générale ---
 
     if data == "btn_main_menu":
@@ -829,8 +862,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data == "btn_vip_menu":
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await send_transient(
+            context, chat_id,
             text="👑 Session VIP — choisissez une sous-session :",
             reply_markup=get_vip_menu_keyboard()
         )
@@ -901,8 +934,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if not entries:
             reply_markup = get_vip_result_keyboard() if mode == 'vip' else get_signal_keyboard()
-            await context.bot.send_message(
-                chat_id=chat_id,
+            await send_transient(
+                context, chat_id,
                 text="Aucun résultat à annuler pour le moment.",
                 reply_markup=reply_markup,
             )
@@ -931,18 +964,18 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         text = f"↩️ Dernier résultat annulé :\n{removed['actif']} • {removed['direction']}"
         reply_markup = get_vip_result_keyboard(include_undo=False) if mode == 'vip' else get_signal_keyboard(include_undo=False)
 
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        await send_transient(context, chat_id, text=text, reply_markup=reply_markup)
         return
 
     # --- Diffusion vers canaux/groupes ---
 
     if data == "btn_broadcast_menu":
         if not context.user_data.get('last_broadcast'):
-            await context.bot.send_message(chat_id=chat_id, text="Rien à diffuser pour l'instant.")
+            await send_transient(context, chat_id, text="Rien à diffuser pour l'instant.")
             return
         if not BROADCAST_TARGETS:
-            await context.bot.send_message(
-                chat_id=chat_id,
+            await send_transient(
+                context, chat_id,
                 text=(
                     "Aucun canal/groupe n'est configuré.\n"
                     "Ajoute-les dans BROADCAST_TARGETS (.env), séparés par des virgules "
@@ -950,21 +983,21 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             )
             return
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await send_transient(
+            context, chat_id,
             text="📤 Choisis où diffuser ce contenu :",
             reply_markup=get_broadcast_targets_keyboard()
         )
         return
 
     if data == "bcast_cancel":
-        await context.bot.send_message(chat_id=chat_id, text="Diffusion annulée.")
+        await send_transient(context, chat_id, text="Diffusion annulée.")
         return
 
     if data == "bcast_all" or data.startswith("bcast_target_"):
         content = context.user_data.get('last_broadcast')
         if not content:
-            await context.bot.send_message(chat_id=chat_id, text="Rien à diffuser pour l'instant.")
+            await send_transient(context, chat_id, text="Rien à diffuser pour l'instant.")
             return
 
         if data == "bcast_all":
@@ -972,7 +1005,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             idx = int(data.replace("bcast_target_", ""))
             if idx < 0 or idx >= len(BROADCAST_TARGETS):
-                await context.bot.send_message(chat_id=chat_id, text="Cible invalide.")
+                await send_transient(context, chat_id, text="Cible invalide.")
                 return
             targets = [BROADCAST_TARGETS[idx]]
 
@@ -1004,8 +1037,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.warning(f"Échec de diffusion vers {target} : {e}")
                 results.append(f"❌ {target} — {e}")
 
-        await context.bot.send_message(
-            chat_id=chat_id,
+        await send_transient(
+            context, chat_id,
             text="📤 Résultat de la diffusion :\n" + "\n".join(results),
         )
         return
