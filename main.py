@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import sys
 import platform
 import random
@@ -109,6 +110,9 @@ def normalize_broadcast_target(target: str):
 DIR_IMG = "IMG"
 DIR_WIN = "IMG_WIN"
 DIR_LOSE = "IMG_LOSE"
+
+# Lien d'inscription PocketOption (utilisé dans les signaux et le message d'accueil)
+POCKET_OPTION_LINK = "https://bit.ly/4ckz9cY"
 
 # Liste complète des paires OTC
 ACTIFS = [
@@ -266,7 +270,7 @@ def generate_signal_data():
 def format_signal_text(signal: dict) -> str:
     """Formate le texte du signal."""
     lien_video = "https://t.me/LegitTrade_academy"
-    lien_inscription = "https://bit.ly/4ckz9cY"
+    lien_inscription = POCKET_OPTION_LINK
 
     return f"""<a href="{lien_video}"><b>VIDÉO D'INSCRIPTION</b></a>
 ______________________________
@@ -667,13 +671,45 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
     )
 
 
+async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, first_name: str = ""):
+    """Envoie les deux messages d'accueil à un visiteur (non-administrateur) qui démarre le bot."""
+    safe_name = html.escape(first_name) if first_name else ""
+    name_part = f" {safe_name}" if safe_name else ""
+
+    text1 = (
+        f"Hey👋{name_part}, <b>bienvenue</b> 😃\n"
+        "Je m'appelle <b>Prince</b> ! Je suis ravi de vous accueillir ici !\n\n"
+        "Je suis <b>trader professionnel des options binaires</b> avec plus de "
+        "<b>10 ans d'expérience</b> ! Je partage mes stratégies de trading "
+        "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je peux t'aider à gagner "
+        "tes premiers <b>1000$</b> dans le trading des options binaires !"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text1, parse_mode="HTML")
+
+    text2 = (
+        "Envoie-moi ton message et je te réponds <b>le plus tôt possible</b> ⏱️\n\n"
+        "<b>📝 INSCRIPTION</b>\n"
+        f"Pour rejoindre le <b>VIP</b>, vous devez vous inscrire sur "
+        f"<a href=\"{POCKET_OPTION_LINK}\">PocketOption</a>.\n"
+        f"Crée un nouveau compte (<b>BONUS DE 30%</b>), et après avoir terminé l'inscription\n\n"
+        f"❗️<b>ENVOIE TON ID</b> depuis votre compte "
+        f"<a href=\"{POCKET_OPTION_LINK}\">PocketOption</a> ici\n"
+        "______________________"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text2, parse_mode="HTML")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /start : affiche le menu principal (ne réinitialise rien)."""
+    """Commande /start : accueil personnalisé pour les visiteurs, menu principal pour l'administrateur."""
     chat_id = update.effective_chat.id
     remember_known_user(context, chat_id)
+
     if not is_authorized(chat_id):
-        await update.message.reply_text("⛔ Accès non autorisé.")
+        sender = update.effective_user
+        first_name = sender.first_name if sender and sender.first_name else ""
+        await send_welcome_messages(chat_id, context, first_name)
         return
+
     await clear_last_transient(context)
     await show_main_menu(chat_id, context)
 
