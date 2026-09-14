@@ -2,6 +2,7 @@ import os
 import re
 import html
 import sys
+import asyncio
 import platform
 import random
 import logging
@@ -834,8 +835,43 @@ async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Réinitialisation quotidienne effectuée pour {count} utilisateur(s).")
 
 
+ANALYSIS_ANIMATION_FRAMES = [
+    "⏳ Analyse de signal",
+    "⏳ Analyse de signal.",
+    "⏳ Analyse de signal..",
+    "⏳ Analyse de signal...",
+    "⌛ Analyse de signal...",
+]
+
+
+async def show_analysis_animation(context: ContextTypes.DEFAULT_TYPE, chat_id):
+    """
+    Affiche une petite animation "⏳ Analyse de signal..." pendant ~5 secondes
+    (un point qui s'ajoute à chaque seconde), puis supprime le message avant
+    que le vrai signal ne soit envoyé.
+    """
+    try:
+        msg = await context.bot.send_message(chat_id=chat_id, text=ANALYSIS_ANIMATION_FRAMES[0])
+    except Exception as e:
+        logger.warning(f"Impossible d'afficher l'animation d'analyse : {e}")
+        return
+
+    for frame in ANALYSIS_ANIMATION_FRAMES[1:]:
+        await asyncio.sleep(1)
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=frame)
+        except Exception:
+            pass  # une édition ratée (rate-limit, etc.) n'interrompt pas l'animation
+
+    await asyncio.sleep(1)
+    await delete_message_safe(context.bot, chat_id, msg.message_id)
+
+
 async def send_signal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envoie un signal avec une image ALEATOIRE du dossier IMG/."""
+    chat_id = update.effective_chat.id
+    await show_analysis_animation(context, chat_id)
+
     signal = generate_signal_data()
     message_text = format_signal_text(signal)
 
@@ -845,7 +881,6 @@ async def send_signal_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['last_signal'] = signal
 
     image_path = get_random_jpeg(DIR_IMG)
-    chat_id = update.effective_chat.id
 
     sent_message = await send_photo_safe(
         bot=context.bot,
