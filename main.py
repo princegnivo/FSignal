@@ -121,6 +121,23 @@ DIR_LOSE = "IMG_LOSE"
 # Lien d'inscription PocketOption (utilisé dans les signaux et le message d'accueil)
 POCKET_OPTION_LINK = "https://bit.ly/4ckz9cY"
 
+# --- Canal Telegram à promouvoir (optionnel) ---
+# CHANNEL_CHAT_ID : @username (canal public) ou id numérique négatif (canal privé).
+# Le bot doit être administrateur de ce canal pour pouvoir vérifier qui y est abonné.
+_channel_env = os.getenv("CHANNEL_CHAT_ID", "").strip()
+if _channel_env.lstrip("-").isdigit():
+    CHANNEL_CHAT_ID = int(_channel_env)
+elif _channel_env:
+    CHANNEL_CHAT_ID = _channel_env if _channel_env.startswith("@") else f"@{_channel_env}"
+else:
+    CHANNEL_CHAT_ID = None
+
+# Lien affiché sur le bouton "Rejoindre le canal". Déduit automatiquement si CHANNEL_CHAT_ID
+# est un @username public ; à renseigner manuellement (lien d'invitation) si le canal est privé.
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
+if not CHANNEL_INVITE_LINK and isinstance(CHANNEL_CHAT_ID, str) and CHANNEL_CHAT_ID.startswith("@"):
+    CHANNEL_INVITE_LINK = f"https://t.me/{CHANNEL_CHAT_ID[1:]}"
+
 # Liste complète des paires OTC
 ACTIFS = [
     # Paires à 92%
@@ -730,6 +747,32 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
     )
 
 
+async def is_channel_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Vérifie si l'utilisateur est abonné au canal configuré. Ne bloque jamais en cas d'erreur."""
+    if CHANNEL_CHAT_ID is None:
+        return True  # Aucun canal configuré : on ne rappelle rien
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_CHAT_ID, user_id=user_id)
+        return member.status in ("creator", "administrator", "member", "restricted")
+    except Exception as e:
+        logger.warning(f"Impossible de vérifier l'abonnement au canal pour {user_id} : {e}")
+        return True  # En cas d'erreur (bot pas admin du canal, etc.), on ne pénalise pas le visiteur
+
+
+async def send_channel_reminder(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """Invite le visiteur à rejoindre le canal, avec un bouton cliquable."""
+    if not CHANNEL_INVITE_LINK:
+        return
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📢 Rejoindre le canal", url=CHANNEL_INVITE_LINK)]]
+    )
+    text = (
+        "📢 Pour ne rater aucune stratégie ni aucun signal gratuit, "
+        "rejoins mon canal officiel !"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
 async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, first_name: str = ""):
     """Envoie les deux messages d'accueil à un visiteur (non-administrateur) qui démarre le bot."""
     safe_name = html.escape(first_name) if first_name else ""
@@ -767,6 +810,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sender = update.effective_user
         first_name = sender.first_name if sender and sender.first_name else ""
         await send_welcome_messages(chat_id, context, first_name)
+
+        user_id = sender.id if sender else chat_id
+        if not await is_channel_member(context, user_id):
+            await send_channel_reminder(chat_id, context)
         return
 
     await clear_last_transient(context)
@@ -1523,6 +1570,18 @@ def main():
         logger.info(f"Groupe de support avec Topics activé (chat_id={SUPPORT_GROUP_ID}).")
     else:
         logger.info("SUPPORT_GROUP_ID non configuré : relais en mode direct uniquement.")
+
+    if CHANNEL_CHAT_ID is not None:
+        if CHANNEL_INVITE_LINK:
+            logger.info(f"Rappel d'abonnement au canal activé (chat_id={CHANNEL_CHAT_ID}).")
+        else:
+            logger.warning(
+                f"CHANNEL_CHAT_ID configuré ({CHANNEL_CHAT_ID}) mais CHANNEL_INVITE_LINK est vide : "
+                "le bouton 'Rejoindre le canal' ne sera pas affiché. Renseigne CHANNEL_INVITE_LINK "
+                "dans le .env (utile notamment pour les canaux privés)."
+            )
+    else:
+        logger.info("CHANNEL_CHAT_ID non configuré : pas de rappel d'abonnement au canal.")
 
     logger.info("Bot prêt et démarré !")
 
