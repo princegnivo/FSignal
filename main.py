@@ -1317,6 +1317,19 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                 remember_broadcast(context, kind='text', text=caption_text, parse_mode="HTML")
 
 
+async def send_to_visitor(context: ContextTypes.DEFAULT_TYPE, target_chat_id, text: str):
+    """
+    Envoie un message à un visiteur. Réutilise automatiquement son direct_messages_topic_id
+    s'il a écrit "en tant que canal" (Telegram exige alors ce paramètre pour pouvoir répondre).
+    """
+    kwargs = {'chat_id': target_chat_id, 'text': text}
+    dm_topics = context.bot_data.get('visitor_dm_topic', {})
+    dm_topic_id = dm_topics.get(target_chat_id)
+    if dm_topic_id is not None:
+        kwargs['direct_messages_topic_id'] = dm_topic_id
+    await context.bot.send_message(**kwargs)
+
+
 async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Relais des messages texte libres, avec deux mécanismes possibles :
@@ -1353,7 +1366,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         try:
-            await context.bot.send_message(chat_id=target_chat_id, text=message.text)
+            await send_to_visitor(context, target_chat_id, message.text)
             log_conversation(context, target_chat_id, 'admin', message.text)
         except Exception as e:
             await message.reply_text(f"❌ Échec de l'envoi : {e}")
@@ -1372,7 +1385,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             target_chat_id = relay_map.get(reply_to.message_id)
             if target_chat_id:
                 try:
-                    await context.bot.send_message(chat_id=target_chat_id, text=message.text)
+                    await send_to_visitor(context, target_chat_id, message.text)
                     log_conversation(context, target_chat_id, 'admin', message.text)
                     await message.reply_text("✅ Réponse envoyée.")
                 except Exception as e:
@@ -1385,6 +1398,12 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
     sender = update.effective_user
     sender_name = sender.full_name if sender else "Inconnu"
     username = f"@{sender.username}" if sender and sender.username else "(pas de pseudo)"
+
+    # Si le visiteur a écrit "en tant que canal", Telegram fournit un direct_messages_topic :
+    # on le mémorise pour pouvoir lui répondre correctement plus tard.
+    dm_topic = getattr(message, 'direct_messages_topic', None)
+    if dm_topic is not None:
+        context.bot_data.setdefault('visitor_dm_topic', {})[chat_id] = dm_topic.topic_id
 
     log_conversation(context, chat_id, 'visitor', message.text)
 
@@ -1443,7 +1462,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid == ADMIN_CHAT_ID:
             continue
         try:
-            await context.bot.send_message(chat_id=uid, text=text)
+            await send_to_visitor(context, uid, text)
             sent += 1
         except Exception as e:
             logger.warning(f"Échec de diffusion à {uid} : {e}")
