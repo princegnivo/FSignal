@@ -131,6 +131,19 @@ def emojify(context: ContextTypes.DEFAULT_TYPE, char: str) -> str:
 
 
 
+def styled_button(text: str, style: str = None, **kwargs) -> InlineKeyboardButton:
+    """
+    Crée un InlineKeyboardButton coloré (style='danger' rouge, 'success' vert, 'primary' bleu).
+    Fonctionnalité Telegram récente (9 février 2026) : sur un client Telegram plus ancien, le
+    bouton s'affiche simplement sans couleur. Si la librairie python-telegram-bot installée est
+    trop ancienne pour connaître ce paramètre, on retombe automatiquement sur un bouton classique.
+    """
+    try:
+        return InlineKeyboardButton(text, style=style, **kwargs)
+    except TypeError:
+        return InlineKeyboardButton(text, **kwargs)
+
+
 def normalize_broadcast_target(target: str):
     """Convertit un identifiant de cible en int (id numérique) ou str (@username)."""
     t = target.strip()
@@ -640,7 +653,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🆓 SESSION GRATUITE", callback_data="btn_free_menu"),
             InlineKeyboardButton("👑 SESSION VIP", callback_data="btn_vip_menu"),
         ],
-        [InlineKeyboardButton("📢 DIFFUSION", callback_data="btn_diffusion_menu")],
+        [styled_button("📢 DIFFUSION", style="primary", callback_data="btn_diffusion_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -655,12 +668,12 @@ def get_signal_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
     """Boutons CAPTURE, BILAN et ANNULER (optionnel) (session gratuite)."""
     keyboard = [
         [
-            InlineKeyboardButton("📸 CAPTURE", callback_data="btn_capture"),
+            styled_button("📸 CAPTURE", style="primary", callback_data="btn_capture"),
             InlineKeyboardButton("BILAN", callback_data="btn_bilan"),
         ],
     ]
     if include_undo:
-        keyboard.append([InlineKeyboardButton("↩️ ANNULER DERNIER", callback_data="btn_undo")])
+        keyboard.append([styled_button("↩️ ANNULER DERNIER", style="danger", callback_data="btn_undo")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -668,16 +681,16 @@ def get_result_keyboard() -> InlineKeyboardMarkup:
     """Boutons de résultat sous le signal, + bouton NEW et DIFFUSER (manuel). Utilisé en gratuit et en VIP."""
     keyboard = [
         [
-            InlineKeyboardButton("MG0", callback_data="res_mg0"),
-            InlineKeyboardButton("MG1", callback_data="res_mg1"),
-            InlineKeyboardButton("MG2", callback_data="res_mg2"),
-            InlineKeyboardButton("MG3", callback_data="res_mg3"),
-            InlineKeyboardButton("❌", callback_data="res_lose"),
+            styled_button("MG0", style="success", callback_data="res_mg0"),
+            styled_button("MG1", style="success", callback_data="res_mg1"),
+            styled_button("MG2", style="success", callback_data="res_mg2"),
+            styled_button("MG3", style="success", callback_data="res_mg3"),
+            styled_button("❌", style="danger", callback_data="res_lose"),
         ],
         [
             InlineKeyboardButton("🔄 NEW", callback_data="btn_new"),
         ],
-        [InlineKeyboardButton("📤 DIFFUSER", callback_data="btn_broadcast_menu")],
+        [styled_button("📤 DIFFUSER", style="primary", callback_data="btn_broadcast_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -721,12 +734,12 @@ def get_vip_result_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
     """Boutons CAPTURE / BILAN / ANNULER (optionnel) / MENU VIP, après un résultat en session VIP."""
     keyboard = [
         [
-            InlineKeyboardButton("📸 CAPTURE", callback_data="btn_capture"),
+            styled_button("📸 CAPTURE", style="primary", callback_data="btn_capture"),
             InlineKeyboardButton("BILAN", callback_data="btn_bilan"),
         ],
     ]
     if include_undo:
-        keyboard.append([InlineKeyboardButton("↩️ ANNULER DERNIER", callback_data="btn_undo")])
+        keyboard.append([styled_button("↩️ ANNULER DERNIER", style="danger", callback_data="btn_undo")])
     keyboard.append([InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -769,7 +782,7 @@ def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
     if BROADCAST_TARGETS:
         keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="diffchoice_all")])
     keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="diffchoice_subscribers")])
-    keyboard.append([InlineKeyboardButton("❌ Annuler", callback_data="diffchoice_cancel")])
+    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -778,8 +791,8 @@ def get_diffusion_add_button_keyboard(count: int) -> InlineKeyboardMarkup:
     keyboard = []
     if count < 3:
         keyboard.append([InlineKeyboardButton("➕ Ajouter un bouton-lien", callback_data="diffbtn_add")])
-    keyboard.append([InlineKeyboardButton("✅ Terminer et diffuser", callback_data="diffbtn_finish")])
-    keyboard.append([InlineKeyboardButton("❌ Annuler", callback_data="diffchoice_cancel")])
+    keyboard.append([styled_button("✅ Terminer et diffuser", style="success", callback_data="diffbtn_finish")])
+    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -998,17 +1011,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await clear_last_transient(context)
 
-    # Premier lancement pour cet admin : demande une seule fois PREMIUM ou STANDARD
-    if context.user_data.get('telegram_tier') is None:
-        logger.info(f"Système détecté pour l'admin {chat_id} : {SYSTEM_OS}")
-        await send_transient(
-            context, chat_id,
-            text="Utilises-tu Telegram PREMIUM ou STANDARD sur ce compte ?",
-            reply_markup=get_tier_choice_keyboard(),
-        )
-        return
-
-    await show_main_menu(chat_id, context)
+    # À chaque /start, redemande PREMIUM ou STANDARD avant d'afficher le menu principal
+    logger.info(f"Système détecté pour l'admin {chat_id} : {SYSTEM_OS}")
+    await send_transient(
+        context, chat_id,
+        text="Utilises-tu Telegram PREMIUM ou STANDARD sur ce compte ?",
+        reply_markup=get_tier_choice_keyboard(),
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
