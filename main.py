@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.error import NetworkError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -175,6 +175,17 @@ else:
 CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
 if not CHANNEL_INVITE_LINK and isinstance(CHANNEL_CHAT_ID, str) and CHANNEL_CHAT_ID.startswith("@"):
     CHANNEL_INVITE_LINK = f"https://t.me/{CHANNEL_CHAT_ID[1:]}"
+
+# --- Canal/groupe VIP (optionnel, distinct du canal ci-dessus) ---
+# Utilisé pour le bouton "ABONNÉS NON VIP" : identifie qui n'est PAS encore dans le VIP.
+# @username (public) ou id numérique négatif (privé). Le bot doit y être administrateur.
+_vip_channel_env = os.getenv("VIP_CHANNEL_CHAT_ID", "").strip()
+if _vip_channel_env.lstrip("-").isdigit():
+    VIP_CHANNEL_CHAT_ID = int(_vip_channel_env)
+elif _vip_channel_env:
+    VIP_CHANNEL_CHAT_ID = _vip_channel_env if _vip_channel_env.startswith("@") else f"@{_vip_channel_env}"
+else:
+    VIP_CHANNEL_CHAT_ID = None
 
 # Liste complète des paires OTC
 ACTIFS = [
@@ -380,26 +391,113 @@ async def auto_broadcast_last(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Échec de diffusion automatique vers {target} : {e}")
 
 
-async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: dict):
-    """Envoie le post composé via DIFFUSION (texte et/ou photo + boutons-liens) vers une destination."""
-    markup = None
-    if draft.get('buttons'):
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton(label, url=url)] for label, url in draft['buttons']])
+_BUTTON_STYLE_WORDS = {
+    "green": "success", "vert": "success",
+    "blue": "primary", "bleu": "primary",
+    "red": "danger", "rouge": "danger",
+}
 
-    if draft.get('photo_file_id'):
-        await context.bot.send_photo(
-            chat_id=dest,
-            photo=draft['photo_file_id'],
-            caption=draft.get('text'),
-            reply_markup=markup,
+
+def parse_diffusion_buttons(text: str):
+    """
+    Parse le format de boutons façon Controller Bot :
+        Texte bouton 1 - http://exemple.com | Texte bouton 2 - http://exemple2.com - style:red
+        Texte bouton 3 - http://exemple3.com
+    Chaque ligne = une rangée de boutons ; "|" sépare les boutons d'une même rangée.
+    Retourne une liste de rangées, chaque rangée étant une liste de tuples (label, url, style).
+    Les entrées mal formées sont simplement ignorées.
+    """
+    rows = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = []
+        for part in line.split("|"):
+            part = part.strip()
+            if not part:
+                continue
+
+            style = None
+            style_match = re.search(r'-\s*style\s*:\s*(\w+)\s*$', part, re.IGNORECASE)
+            if style_match:
+                style = _BUTTON_STYLE_WORDS.get(style_match.group(1).lower())
+                part = part[:style_match.start()].rstrip()
+
+            if " - " not in part:
+                continue
+            label, url = part.rsplit(" - ", 1)
+            label = label.strip()
+            url = url.strip()
+            if not label or not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            row.append((label, url, style))
+
+        if row:
+            rows.append(row)
+
+    return rows
+
+
+def build_diffusion_markup(button_rows: list):
+    """Construit un InlineKeyboardMarkup à partir de rangées de boutons (label, url, style)."""
+    if not button_rows:
+        return None
+    keyboard = []
+    for row in button_rows:
+        keyboard.append([styled_button(label, style=style, url=url) for label, url, style in row])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: dict, dm_topic_id=None) -> list:
+    """
+    Envoie le post composé via DIFFUSION vers une destination, en conservant le format HTML
+    (gras, liens, etc.) tel qu'écrit par l'admin. Si texte ET photo sont présents, envoie le
+    texte (avec les boutons) d'abord, puis la photo juste en dessous, sans légende ni boutons
+    dupliqués. `dm_topic_id` est nécessaire pour un visiteur ayant écrit via les "Messages
+    directs" d'un canal. Retourne la liste des (chat_id, message_id) effectivement envoyés.
+    """
+    markup = build_diffusion_markup(draft.get('buttons'))
+    text = draft.get('text')
+    photo_file_id = draft.get('photo_file_id')
+    sent_refs = []
+    extra = {'direct_messages_topic_id': dm_topic_id} if dm_topic_id is not None else {}
+
+    if text and photo_file_id:
+        sent = await context.bot.send_message(
+            chat_id=dest, text=text, parse_mode="HTML",
+            reply_markup=markup, disable_web_page_preview=True, **extra,
         )
+        sent_refs.append((sent.chat_id, sent.message_id))
+        sent_photo = await context.bot.send_photo(chat_id=dest, photo=photo_file_id, **extra)
+        sent_refs.append((sent_photo.chat_id, sent_photo.message_id))
+    elif photo_file_id:
+        sent_photo = await context.bot.send_photo(
+            chat_id=dest, photo=photo_file_id, reply_markup=markup, **extra,
+        )
+        sent_refs.append((sent_photo.chat_id, sent_photo.message_id))
     else:
-        await context.bot.send_message(
-            chat_id=dest,
-            text=draft.get('text') or '',
-            reply_markup=markup,
-            disable_web_page_preview=True,
+        sent = await context.bot.send_message(
+            chat_id=dest, text=text or '', parse_mode="HTML",
+            reply_markup=markup, disable_web_page_preview=True, **extra,
         )
+        sent_refs.append((sent.chat_id, sent.message_id))
+
+    return sent_refs
+
+
+async def show_diffusion_preview(context: ContextTypes.DEFAULT_TYPE, chat_id, draft: dict):
+    """Envoie un aperçu exact du post (dans le chat de l'admin) avant confirmation de diffusion."""
+    try:
+        await send_diffusion_post(context, chat_id, draft)
+    except Exception as e:
+        logger.warning(f"Échec de l'aperçu de diffusion : {e}")
+
+    await send_transient(
+        context, chat_id,
+        text="👆 Voici un aperçu de ton post. Diffuser ?",
+        reply_markup=get_diffusion_preview_keyboard(),
+    )
 
 
 async def diffuse_capture_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str):
@@ -465,12 +563,14 @@ def get_specific_jpeg_only(directory: str, asset_filename: str):
 
 
 def generate_signal_data():
-    """Génère les données temporelles d'un signal."""
+    """Génère les données temporelles d'un signal. L'heure d'entrée tombe toujours sur une minute paire."""
     actif = random.choice(ACTIFS)
     direction = random.choice(["ACHAT", "VENTE"])
     now = datetime.now(TZ)
 
     entre = (now + timedelta(minutes=3)).replace(second=0, microsecond=0)
+    if entre.minute % 2 != 0:
+        entre += timedelta(minutes=1)
     mg1 = entre + timedelta(minutes=2)
     mg2 = entre + timedelta(minutes=4)
     mg3 = entre + timedelta(minutes=6)
@@ -646,6 +746,19 @@ def format_stats_block(title: str, entries: list) -> str:
 
 # --- CLAVIERS INLINE ---
 
+ADMIN_QUICK_KEYBOARD = ReplyKeyboardMarkup(
+    [["🏠 Menu", "📊 Stats"], ["📢 Diffusion", "ℹ️ Aide"]],
+    resize_keyboard=True,
+)
+
+ADMIN_QUICK_ACTIONS = {
+    "🏠 Menu": "menu",
+    "📊 Stats": "stats",
+    "📢 Diffusion": "diffusion",
+    "ℹ️ Aide": "help",
+}
+
+
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Menu principal : choix entre session gratuite, session VIP et diffusion libre."""
     keyboard = [
@@ -748,6 +861,7 @@ def get_vip_bilan_keyboard(session_key: str) -> InlineKeyboardMarkup:
     """Boutons affichés sous le bilan d'une sous-session VIP."""
     keyboard = [
         [InlineKeyboardButton("🔄 RECOMMENCER CETTE SESSION", callback_data=f"vip_reset_{session_key}")],
+        [InlineKeyboardButton("👥 ABONNÉS NON VIP", callback_data=f"vipnonvip_{session_key}")],
         [InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -786,14 +900,50 @@ def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_diffusion_add_button_keyboard(count: int) -> InlineKeyboardMarkup:
-    """Proposé après le texte/l'image, et après chaque bouton ajouté (max 3)."""
-    keyboard = []
-    if count < 3:
-        keyboard.append([InlineKeyboardButton("➕ Ajouter un bouton-lien", callback_data="diffbtn_add")])
-    keyboard.append([styled_button("✅ Terminer et diffuser", style="success", callback_data="diffbtn_finish")])
-    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")])
+def get_diffusion_buttons_prompt_keyboard() -> InlineKeyboardMarkup:
+    """Affiché sous l'invite de saisie des boutons-liens."""
+    keyboard = [
+        [InlineKeyboardButton("🚫 Aucun bouton", callback_data="diffbtn_none")],
+        [InlineKeyboardButton("↩️ Annuler", callback_data="diffbtn_back")],
+    ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_diffusion_preview_keyboard() -> InlineKeyboardMarkup:
+    """Affiché sous l'aperçu du post, avant confirmation de la diffusion."""
+    keyboard = [
+        [styled_button("📤 Diffuser", style="success", callback_data="diffbtn_finish")],
+        [styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_diffusion_result_keyboard() -> InlineKeyboardMarkup:
+    """Affiché après une diffusion réussie : permet de supprimer les messages envoyés partout."""
+    keyboard = [
+        [styled_button("🗑️ Supprimer le message diffusé", style="danger", callback_data="diffdelete_confirm")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+DIFFUSION_BUTTONS_PROMPT = (
+    "Envoyez-moi une liste de boutons pour lien URL pour le message. Veuillez utiliser ce format:\n"
+    "Texte bouton 1 - http://www.example.com/ | Texte bouton 2 - http://www.example2.com/\n"
+    "Texte bouton 3 - http://www.example3.com/\n"
+    "\n"
+    "Vous pouvez également spécifier une couleur pour les boutons:\n"
+    "\n"
+    "Bouton 1 - http://example1.com - style:green\n"
+    "Bouton 2 - http://example2.com - style:blue\n"
+    "Bouton 3 - http://example3.com - style:red\n"
+    "\n"
+    "Utilisez le séparateur | pour ajouter jusqu'à trois boutons à la suite. Exemple:\n"
+    "\n"
+    "Bouton 1 - http://example1.com | Bouton 2 - http://example2.com\n"
+    "Bouton 3 - http://example3.com - style:red | Bouton 4 - http://example4.com\n"
+    "\n"
+    "choisissez 'Annuler' pour revenir à la création du message."
+)
 
 
 async def delete_message_safe(bot, chat_id, message_id) -> bool:
@@ -929,15 +1079,17 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
         await prompt_signal_start(chat_id, context, prefix=prefix)
 
 
-async def is_channel_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """Vérifie si l'utilisateur est abonné au canal configuré. Ne bloque jamais en cas d'erreur."""
-    if CHANNEL_CHAT_ID is None:
-        return True  # Aucun canal configuré : on ne rappelle rien
+async def is_channel_member(context: ContextTypes.DEFAULT_TYPE, user_id: int, channel=None) -> bool:
+    """Vérifie si l'utilisateur est abonné au canal donné (par défaut CHANNEL_CHAT_ID).
+    Ne bloque jamais en cas d'erreur : traite comme membre si indéterminable."""
+    target_channel = channel if channel is not None else CHANNEL_CHAT_ID
+    if target_channel is None:
+        return True  # Aucun canal configuré : on ne rappelle/filtre rien
     try:
-        member = await context.bot.get_chat_member(chat_id=CHANNEL_CHAT_ID, user_id=user_id)
+        member = await context.bot.get_chat_member(chat_id=target_channel, user_id=user_id)
         return member.status in ("creator", "administrator", "member", "restricted")
     except Exception as e:
-        logger.warning(f"Impossible de vérifier l'abonnement au canal pour {user_id} : {e}")
+        logger.warning(f"Impossible de vérifier l'abonnement à {target_channel} pour {user_id} : {e}")
         return True  # En cas d'erreur (bot pas admin du canal, etc.), on ne pénalise pas le visiteur
 
 
@@ -998,6 +1150,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /start : accueil personnalisé pour les visiteurs, menu principal pour l'administrateur."""
     chat_id = update.effective_chat.id
     remember_known_user(context, chat_id)
+    await clear_last_transient(context)
 
     if not is_authorized(chat_id):
         sender = update.effective_user
@@ -1009,7 +1162,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_channel_reminder(chat_id, context)
         return
 
-    await clear_last_transient(context)
+    # Réinitialise tout état de composition en cours (diffusion, capture) pour repartir propre
+    context.user_data['diffusion_draft'] = None
+    context.user_data['awaiting_capture'] = False
 
     # À chaque /start, redemande PREMIUM ou STANDARD avant d'afficher le menu principal
     logger.info(f"Système détecté pour l'admin {chat_id} : {SYSTEM_OS}")
@@ -1272,12 +1427,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "Telegram indique que ce compte n'a pas Premium actif : "
                     "basculé sur STANDARD."
                 ),
+                reply_markup=ADMIN_QUICK_KEYBOARD,
             )
         else:
             tier = 'premium' if claimed_premium else 'standard'
             context.user_data['telegram_tier'] = tier
             label = "💎 PREMIUM" if tier == 'premium' else "⭐ STANDARD"
-            await send_transient(context, chat_id, text=f"✅ Mode {label} activé.")
+            await send_transient(
+                context, chat_id, text=f"✅ Mode {label} activé.",
+                reply_markup=ADMIN_QUICK_KEYBOARD,
+            )
 
         await show_main_menu(chat_id, context)
         return
@@ -1331,6 +1490,54 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await enter_vip_session(chat_id, context, session_key, reset=True)
         else:
             await show_main_menu(chat_id, context)
+        return
+
+    if data.startswith("vipnonvip_"):
+        session_key = data.replace("vipnonvip_", "")
+        if session_key not in VIP_SESSION_LABELS:
+            await send_transient(context, chat_id, text="Session invalide.")
+            return
+
+        if VIP_CHANNEL_CHAT_ID is None:
+            await send_transient(
+                context, chat_id,
+                text=(
+                    "Aucun canal/groupe VIP n'est configuré.\n"
+                    "Renseigne VIP_CHANNEL_CHAT_ID dans le .env (le bot doit y être admin)."
+                ),
+            )
+            return
+
+        vip_history = context.user_data.get('vip_history', empty_vip_history())
+        entries = vip_history.get(session_key, [])
+        icon, label = VIP_SESSION_LABELS[session_key]
+        bilan_text = format_bilan_text(
+            entries,
+            header_title=f"RAPPORT SESSION VIP - {label}",
+            blockquote_title=f"{icon} Session VIP {label}",
+        )
+        promo_text = "🔥 Regarde les résultats de notre session VIP aujourd'hui :\n\n" + bilan_text
+
+        known = context.bot_data.get('known_users', set())
+        sent, skipped, failed = 0, 0, 0
+        for uid in known:
+            uid_chat_id, _ = parse_visitor_key(uid)
+            if uid_chat_id == ADMIN_CHAT_ID:
+                continue
+            if await is_channel_member(context, uid_chat_id, channel=VIP_CHANNEL_CHAT_ID):
+                skipped += 1
+                continue
+            try:
+                await send_to_visitor(context, uid, promo_text)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Échec d'envoi ABONNÉS NON VIP à {uid} : {e}")
+                failed += 1
+
+        await send_transient(
+            context, chat_id,
+            text=f"👥 Envoyé à {sent} abonné(s) non-VIP ({skipped} déjà VIP, {failed} échec(s)).",
+        )
         return
 
     # --- Session gratuite : NEW SESSION (équivaut à redémarrer la session gratuite) ---
@@ -1406,13 +1613,29 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if data == "diffbtn_add":
+    if data == "diffbtn_back":
         draft = context.user_data.get('diffusion_draft')
         if not draft:
             await send_transient(context, chat_id, text="Rien à diffuser.")
             return
-        draft['step'] = 'button_label'
-        await send_transient(context, chat_id, text="✏️ Texte du bouton :")
+        draft['text'] = None
+        draft['photo_file_id'] = None
+        draft['buttons'] = []
+        draft['step'] = 'content'
+        await send_transient(
+            context, chat_id,
+            text="✍️ Envoie le texte et/ou la photo de ta publication :",
+        )
+        return
+
+    if data == "diffbtn_none":
+        draft = context.user_data.get('diffusion_draft')
+        if not draft:
+            await send_transient(context, chat_id, text="Rien à diffuser.")
+            return
+        draft['buttons'] = []
+        draft['step'] = 'preview'
+        await show_diffusion_preview(context, chat_id, draft)
         return
 
     if data == "diffbtn_finish":
@@ -1422,28 +1645,49 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if draft['target'] == 'all':
-            destinations = [normalize_broadcast_target(t) for t in BROADCAST_TARGETS]
+            destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
         elif draft['target'] == 'subscribers':
             known = context.bot_data.get('known_users', set())
-            destinations = [uid for uid in known if uid != ADMIN_CHAT_ID]
+            destinations = []
+            for key in known:
+                d_chat_id, d_topic_id = parse_visitor_key(key)
+                if d_chat_id == ADMIN_CHAT_ID:
+                    continue
+                destinations.append((d_chat_id, d_topic_id))
         else:
-            destinations = [normalize_broadcast_target(draft['target'])]
+            destinations = [(normalize_broadcast_target(draft['target']), None)]
 
         sent, failed = 0, 0
-        for dest in destinations:
+        all_refs = []
+        for dest, dm_topic_id in destinations:
             try:
-                await send_diffusion_post(context, dest, draft)
+                refs = await send_diffusion_post(context, dest, draft, dm_topic_id=dm_topic_id)
+                all_refs.extend(refs)
                 sent += 1
             except Exception as e:
                 logger.warning(f"Échec de diffusion (post libre) vers {dest} : {e}")
                 failed += 1
 
         context.user_data['diffusion_draft'] = None
+        context.user_data['last_diffusion_sent'] = all_refs
+
         await send_transient(
             context, chat_id,
             text=f"📢 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).",
+            reply_markup=get_diffusion_result_keyboard() if all_refs else None,
         )
-        await show_main_menu(chat_id, context)
+        return
+
+    if data == "diffdelete_confirm":
+        refs = context.user_data.pop('last_diffusion_sent', [])
+        if not refs:
+            await send_transient(context, chat_id, text="Rien à supprimer.")
+            return
+        deleted = 0
+        for ref_chat, ref_msg in refs:
+            if await delete_message_safe(context.bot, ref_chat, ref_msg):
+                deleted += 1
+        await send_transient(context, chat_id, text=f"🗑️ {deleted}/{len(refs)} message(s) supprimé(s).")
         return
 
     if data == "btn_capture":
@@ -1630,14 +1874,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await auto_broadcast_last(context)
 
 
-async def send_to_visitor(context: ContextTypes.DEFAULT_TYPE, visitor_key: str, text: str):
+async def send_to_visitor(context: ContextTypes.DEFAULT_TYPE, visitor_key: str, text: str, parse_mode: str = None):
     """
     Envoie un message à un visiteur à partir de sa clé (voir make_visitor_key). Ajoute
     automatiquement le direct_messages_topic_id si ce visiteur a écrit via les "Messages
     directs" d'un canal (Telegram exige ce paramètre pour pouvoir lui répondre).
     """
     chat_id, dm_topic_id = parse_visitor_key(visitor_key)
-    kwargs = {'chat_id': chat_id, 'text': text}
+    kwargs = {'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode}
     if dm_topic_id is not None:
         kwargs['direct_messages_topic_id'] = dm_topic_id
     await context.bot.send_message(**kwargs)
@@ -1661,13 +1905,13 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
     draft = context.user_data.get('diffusion_draft')
     if draft and draft.get('step') == 'content':
         draft['photo_file_id'] = message.photo[-1].file_id
-        if message.caption:
-            draft['text'] = message.caption
-        draft['step'] = 'button_choice'
+        if message.caption_html:
+            draft['text'] = message.caption_html
+        draft['step'] = 'buttons'
         await send_transient(
             context, chat_id,
-            text="Ajouter un bouton-lien à ce post ?",
-            reply_markup=get_diffusion_add_button_keyboard(len(draft['buttons'])),
+            text=DIFFUSION_BUTTONS_PROMPT,
+            reply_markup=get_diffusion_buttons_prompt_keyboard(),
         )
         return
 
@@ -1712,6 +1956,29 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
 
     chat_id = update.effective_chat.id
 
+    # --- Cas -1 : raccourci du clavier persistant (Menu / Stats / Diffusion / Aide) ---
+    if is_admin(chat_id) and message.text in ADMIN_QUICK_ACTIONS:
+        action = ADMIN_QUICK_ACTIONS[message.text]
+
+        # Un raccourci abandonne toute composition en cours (diffusion, capture)
+        context.user_data['diffusion_draft'] = None
+        context.user_data['awaiting_capture'] = False
+        await clear_last_transient(context)
+
+        if action == "menu":
+            await show_main_menu(chat_id, context)
+        elif action == "stats":
+            await stats_command(update, context)
+        elif action == "help":
+            await help_command(update, context)
+        elif action == "diffusion":
+            await send_transient(
+                context, chat_id,
+                text="📢 Choisis la cible de ta publication :",
+                reply_markup=get_diffusion_target_keyboard(),
+            )
+        return
+
     # --- Cas 0 : l'admin est en train de composer un post DIFFUSION ---
     if is_admin(chat_id):
         draft = context.user_data.get('diffusion_draft')
@@ -1719,40 +1986,27 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             step = draft.get('step')
 
             if step == 'content':
-                draft['text'] = message.text
-                draft['step'] = 'button_choice'
+                draft['text'] = message.text_html
+                draft['step'] = 'buttons'
                 await send_transient(
                     context, chat_id,
-                    text="Ajouter un bouton-lien à ce post ?",
-                    reply_markup=get_diffusion_add_button_keyboard(len(draft['buttons'])),
+                    text=DIFFUSION_BUTTONS_PROMPT,
+                    reply_markup=get_diffusion_buttons_prompt_keyboard(),
                 )
                 return
 
-            if step == 'button_label':
-                draft['pending_label'] = message.text.strip()
-                draft['step'] = 'button_url'
-                await send_transient(
-                    context, chat_id,
-                    text="🔗 Lien du bouton (doit commencer par http:// ou https://) :",
-                )
-                return
-
-            if step == 'button_url':
-                url = message.text.strip()
-                if not (url.startswith("http://") or url.startswith("https://")):
+            if step == 'buttons':
+                rows = parse_diffusion_buttons(message.text)
+                if not rows:
                     await send_transient(
                         context, chat_id,
-                        text="⚠️ Lien invalide, il doit commencer par http:// ou https://. Réessaie :",
+                        text="⚠️ Format non reconnu. Réessaie, ou choisis une option ci-dessous :",
+                        reply_markup=get_diffusion_buttons_prompt_keyboard(),
                     )
                     return
-                label = draft.pop('pending_label', 'Lien')
-                draft['buttons'].append((label, url))
-                draft['step'] = 'button_choice'
-                await send_transient(
-                    context, chat_id,
-                    text=f"✅ Bouton ajouté ({len(draft['buttons'])}/3).",
-                    reply_markup=get_diffusion_add_button_keyboard(len(draft['buttons'])),
-                )
+                draft['buttons'] = rows
+                draft['step'] = 'preview'
+                await show_diffusion_preview(context, chat_id, draft)
                 return
 
     # --- Cas 1 : message envoyé DANS le groupe de support (dans un topic donné) ---
@@ -1772,7 +2026,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         try:
-            await send_to_visitor(context, target_key, message.text)
+            await send_to_visitor(context, target_key, message.text_html, parse_mode="HTML")
             log_conversation(context, target_key, 'admin', message.text)
         except Exception as e:
             await message.reply_text(f"❌ Échec de l'envoi : {e}")
@@ -1786,7 +2040,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             target_key = relay_map.get(reply_to.message_id)
             if target_key:
                 try:
-                    await send_to_visitor(context, target_key, message.text)
+                    await send_to_visitor(context, target_key, message.text_html, parse_mode="HTML")
                     log_conversation(context, target_key, 'admin', message.text)
                     await message.reply_text("✅ Réponse envoyée.")
                 except Exception as e:
@@ -1865,7 +2119,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     known_users = context.bot_data.get('known_users', set())
     sent, failed = 0, 0
     for uid in known_users:
-        if uid == ADMIN_CHAT_ID:
+        uid_chat_id, _ = parse_visitor_key(uid)
+        if uid_chat_id == ADMIN_CHAT_ID:
             continue
         try:
             await send_to_visitor(context, uid, text)
