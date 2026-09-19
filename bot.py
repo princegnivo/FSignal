@@ -1164,8 +1164,8 @@ async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, fir
         "Je m'appelle <b>Prince</b> ! Je suis ravi de vous accueillir ici !\n\n"
         "Je suis <b>trader professionnel des options binaires</b> avec plus de "
         "<b>10 ans d'expérience</b> ! Je partage mes stratégies de trading "
-        "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je peux vous aider à gagner "
-        "vos premiers <b>1000$</b> dans le trading des options binaires !"
+        "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je t'aider à gagner "
+        "tes premiers <b>1000$</b> dans le trading des options binaires !"
     )
     await context.bot.send_message(chat_id=chat_id, text=text1, parse_mode="HTML")
 
