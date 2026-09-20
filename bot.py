@@ -759,7 +759,7 @@ def format_stats_block(title: str, entries: list) -> str:
 # --- CLAVIERS INLINE ---
 
 ADMIN_QUICK_KEYBOARD = ReplyKeyboardMarkup(
-    [["🏠 Menu", "📊 Stats"], ["📢 Diffusion", "ℹ️ Aide"]],
+    [["🏠 Menu", "📊 Stats"], ["📢 Diffusion", "ℹ️ Aide"], ["🗑️ RESET STATS"]],
     resize_keyboard=True,
 )
 
@@ -768,6 +768,7 @@ ADMIN_QUICK_ACTIONS = {
     "📊 Stats": "stats",
     "📢 Diffusion": "diffusion",
     "ℹ️ Aide": "help",
+    "🗑️ RESET STATS": "reset_stats",
 }
 
 
@@ -909,6 +910,18 @@ def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
         keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="diffchoice_all")])
     keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="diffchoice_subscribers")])
     keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
+    """Boutons de cible pour diffuser directement le rapport de statistiques."""
+    keyboard = [
+        [InlineKeyboardButton(f"📡 {target}", callback_data=f"statdiff_target_{i}")]
+        for i, target in enumerate(BROADCAST_TARGETS)
+    ]
+    if BROADCAST_TARGETS:
+        keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="statdiff_all")])
+    keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="statdiff_subscribers")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1164,7 +1177,7 @@ async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, fir
         "Je m'appelle <b>Prince</b> ! Je suis ravi de vous accueillir ici !\n\n"
         "Je suis <b>trader professionnel des options binaires</b> avec plus de "
         "<b>10 ans d'expérience</b> ! Je partage mes stratégies de trading "
-        "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je t'aider à gagner "
+        "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je peux t'aider à gagner "
         "tes premiers <b>1000$</b> dans le trading des options binaires !"
     )
     await context.bot.send_message(chat_id=chat_id, text=text1, parse_mode="HTML")
@@ -1266,7 +1279,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocks.append(format_stats_block("👑 VIP (cumulé)", vip_all_entries))
 
     text = "<b>📊 STATISTIQUES</b>\n\n" + "\n\n".join(blocks)
-    await update.message.reply_text(text, parse_mode="HTML")
+    remember_broadcast(context, kind='text', text=text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_stats_diffusion_keyboard())
 
 
 async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1619,6 +1633,48 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Le signal remplacé n'est pas conservé dans l'historique
         context.user_data['last_signal'] = None
         await send_signal_action(update, context)
+        return
+
+    if data == "statdiff_all" or data == "statdiff_subscribers" or data.startswith("statdiff_target_"):
+        content = context.user_data.get('last_broadcast')
+        if not content:
+            await send_transient(context, chat_id, text="Rien à diffuser.")
+            return
+
+        if data == "statdiff_all":
+            destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
+        elif data == "statdiff_subscribers":
+            known = context.bot_data.get('known_users', set())
+            destinations = []
+            for key in known:
+                d_chat_id, d_topic_id = parse_visitor_key(key)
+                if d_chat_id == ADMIN_CHAT_ID:
+                    continue
+                destinations.append((d_chat_id, d_topic_id))
+        else:
+            idx = int(data.replace("statdiff_target_", ""))
+            if idx < 0 or idx >= len(BROADCAST_TARGETS):
+                await send_transient(context, chat_id, text="Cible invalide.")
+                return
+            destinations = [(normalize_broadcast_target(BROADCAST_TARGETS[idx]), None)]
+
+        sent, failed = 0, 0
+        for dest, dm_topic_id in destinations:
+            try:
+                extra = {'direct_messages_topic_id': dm_topic_id} if dm_topic_id is not None else {}
+                await context.bot.send_message(
+                    chat_id=dest, text=content.get('text') or '',
+                    parse_mode=content.get('parse_mode'), **extra,
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Échec de diffusion des stats vers {dest} : {e}")
+                failed += 1
+
+        await send_transient(
+            context, chat_id,
+            text=f"📤 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).",
+        )
         return
 
     if data == "btn_diffusion_menu":
@@ -2049,8 +2105,21 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
     chat_id = update.effective_chat.id
 
     # --- Cas -1 : raccourci du clavier persistant (Menu / Stats / Diffusion / Aide) ---
-    if is_admin(chat_id) and message.text in ADMIN_QUICK_ACTIONS:
-        action = ADMIN_QUICK_ACTIONS[message.text]
+    incoming_text = message.text.strip()
+    logger.info(f"Message reçu de {chat_id} (admin={is_admin(chat_id)}) : {incoming_text!r}")
+
+    quick_action = ADMIN_QUICK_ACTIONS.get(incoming_text)
+    if quick_action is None:
+        # Repli tolérant : ignore l'emoji/la casse/les espaces au cas où le clavier
+        # afficherait un texte légèrement différent selon l'appareil.
+        simplified = re.sub(r'[^\w]', '', incoming_text).lower()
+        for label, action_name in ADMIN_QUICK_ACTIONS.items():
+            if re.sub(r'[^\w]', '', label).lower() == simplified:
+                quick_action = action_name
+                break
+
+    if is_admin(chat_id) and quick_action is not None:
+        action = quick_action
 
         # Un raccourci abandonne toute composition en cours (diffusion, capture)
         context.user_data['diffusion_draft'] = None
@@ -2069,6 +2138,10 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 text="📢 Choisis la cible de ta publication :",
                 reply_markup=get_diffusion_target_keyboard(),
             )
+        elif action == "reset_stats":
+            context.user_data['history'] = []
+            context.user_data['vip_history'] = empty_vip_history()
+            await context.bot.send_message(chat_id=chat_id, text="🗑️ Statistiques réinitialisées.")
         return
 
     # --- Cas 0 : l'admin est en train de composer un post DIFFUSION ---
