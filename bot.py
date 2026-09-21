@@ -2,14 +2,21 @@ import os
 import re
 import html
 import sys
+import io
+import shutil
 import asyncio
 import platform
 import random
 import logging
+from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+import httpx
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, LinkPreviewOptions
 from telegram.error import NetworkError, TimedOut
@@ -41,11 +48,13 @@ if SYSTEM_OS == "Windows":
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Configuration du Logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Configuration du Logging : console + fichier persistant (rotatif, 5 Mo x 3 fichiers)
+_log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+_file_handler = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+_file_handler.setFormatter(_log_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 logger = logging.getLogger(__name__)
 
 # --- Fuseau horaire ---
@@ -151,6 +160,19 @@ def normalize_broadcast_target(target: str):
         return int(t)
     return t
 
+
+async def upload_to_catbox(file_bytes: bytes, filename: str = "image.jpg") -> str:
+    """Upload une image sur catbox.moe (hébergeur public, gratuit, sans clé) et retourne son URL directe."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        files = {"fileToUpload": (filename, file_bytes, "image/jpeg")}
+        data = {"reqtype": "fileupload"}
+        resp = await client.post(CATBOX_UPLOAD_URL, data=data, files=files)
+        resp.raise_for_status()
+        url = resp.text.strip()
+        if not url.startswith("http"):
+            raise ValueError(f"Réponse inattendue de catbox.moe : {url}")
+        return url
+
 # Dossiers d'images
 DIR_IMG = "IMG"
 DIR_WIN = "IMG_WIN"
@@ -187,14 +209,22 @@ elif _vip_channel_env:
 else:
     VIP_CHANNEL_CHAT_ID = None
 
-# --- Canal de stockage d'images (optionnel) ---
-# Canal PUBLIC dédié à l'archivage des photos utilisées pour la diffusion (bouton "Ajouter
-# photo"). Le bot y publie silencieusement la photo, puis construit un lien public
-# https://t.me/<canal>/<id_message> pour générer un aperçu agrandi sous le texte, sans jamais
-# exposer le token du bot (contrairement au lien de fichier interne de Telegram).
-# Doit être un @username PUBLIC (obligatoire pour que le lien fonctionne pour tout le monde).
-_storage_channel_env = os.getenv("STORAGE_CHANNEL_USERNAME", "").strip().lstrip("@")
-STORAGE_CHANNEL_USERNAME = _storage_channel_env or None
+# --- Hébergement d'images pour la diffusion (catbox.moe, aucune clé requise) ---
+# Utilisé par le bouton "➕ Ajouter photo" : l'image est uploadée sur catbox.moe (hébergeur
+# public gratuit) puis son URL directe est cachée dans un lien invisible du texte, pour générer
+# un aperçu agrandi sous le message via LinkPreviewOptions.
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
+
+# --- Anti-spam visiteurs ---
+RATE_LIMIT_MAX_MESSAGES = int(os.getenv("RATE_LIMIT_MAX_MESSAGES", "5"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+# --- Sauvegarde automatique de la persistance ---
+BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "true").lower() == "true"
+BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))
+
+# --- Rappel automatique de canal (pour les visiteurs non abonnés) ---
+CHANNEL_REMINDER_DAYS = int(os.getenv("CHANNEL_REMINDER_DAYS", "3"))
 
 # Liste complète des paires OTC
 ACTIFS = [
@@ -448,13 +478,25 @@ def parse_diffusion_buttons(text: str):
     return rows
 
 
+RANDOM_BUTTON_STYLES = ["success", "danger", "primary"]
+
+
 def build_diffusion_markup(button_rows: list):
-    """Construit un InlineKeyboardMarkup à partir de rangées de boutons (label, url, style)."""
+    """
+    Construit un InlineKeyboardMarkup à partir de rangées de boutons (label, url, style).
+    Couleur aléatoire par rangée : tous les boutons d'une même rangée partagent la même
+    couleur (choisie au hasard), sauf si un style a été explicitement précisé (style:xxx)
+    pour un bouton donné, auquel cas ce choix explicite est respecté.
+    """
     if not button_rows:
         return None
     keyboard = []
     for row in button_rows:
-        keyboard.append([styled_button(label, style=style, url=url) for label, url, style in row])
+        row_color = random.choice(RANDOM_BUTTON_STYLES)
+        keyboard.append([
+            styled_button(label, style=(style or row_color), url=url)
+            for label, url, style in row
+        ])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -546,7 +588,7 @@ async def diffuse_capture_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_i
         return
 
     share_keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("PARTAGEZ VOS RÉSULTATS 〽️", url="https://t.me/VIPLegit_bot")]]
+        [[styled_button("PARTAGEZ VOS RÉSULTATS 〽️", style=random.choice(RANDOM_BUTTON_STYLES), url="https://t.me/VIPLegit_bot")]]
     )
 
     targets = BROADCAST_TARGETS if target_setting == 'all' else [target_setting]
@@ -727,6 +769,37 @@ def format_full_vip_report(vip_history: dict) -> str:
     return header + "\n\n" + "\n\n".join(blocks) + "\n\n" + recap
 
 
+def generate_performance_chart(entries: list):
+    """Génère un graphique PNG (BytesIO) du taux de réussite par jour."""
+    daily = {}
+    for e in entries:
+        if not e.get('entre'):
+            continue
+        day = e['entre'].date()
+        stats = daily.setdefault(day, {'gains': 0, 'total': 0})
+        stats['total'] += 1
+        if e['result'] != 'lose':
+            stats['gains'] += 1
+
+    days = sorted(daily.keys())
+    rates = [daily[d]['gains'] / daily[d]['total'] * 100 for d in days]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot([d.strftime('%d/%m') for d in days], rates, marker='o', color='#2ecc71', linewidth=2)
+    ax.set_ylabel('Taux de réussite (%)')
+    ax.set_title('Performance par jour')
+    ax.set_ylim(0, 100)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    plt.close(fig)
+    buf.seek(0)
+    buf.name = "performance.png"
+    return buf
+
+
 def compute_stats(entries: list) -> dict:
     """Calcule les statistiques (taux de réussite, meilleur/pire actif) sur une liste de trades."""
     total = len(entries)
@@ -785,7 +858,7 @@ def format_stats_block(title: str, entries: list) -> str:
 # --- CLAVIERS INLINE ---
 
 ADMIN_QUICK_KEYBOARD = ReplyKeyboardMarkup(
-    [["🏠 Menu", "📊 Stats"], ["📢 Diffusion", "ℹ️ Aide"], ["🗑️ RESET STATS"]],
+    [["🏠 Menu", "📊 Stats"], ["📢 Diffusion", "ℹ️ Aide"], ["📊 Sondage", "🗑️ RESET STATS"]],
     resize_keyboard=True,
 )
 
@@ -795,6 +868,7 @@ ADMIN_QUICK_ACTIONS = {
     "📢 Diffusion": "diffusion",
     "ℹ️ Aide": "help",
     "🗑️ RESET STATS": "reset_stats",
+    "📊 Sondage": "poll",
 }
 
 
@@ -939,8 +1013,31 @@ def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_poll_target_keyboard() -> InlineKeyboardMarkup:
+    """Choix de la cible pour l'envoi d'un sondage."""
+    keyboard = [
+        [InlineKeyboardButton(f"📡 {target}", callback_data=f"polltarget_idx_{i}")]
+        for i, target in enumerate(BROADCAST_TARGETS)
+    ]
+    if BROADCAST_TARGETS:
+        keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="polltarget_all")])
+    keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="polltarget_subscribers")])
+    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="polltarget_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def parse_poll_spec(text: str):
+    """Parse 'Question | Option1 | Option2 | ...' -> (question, [options]) ou (None, None)."""
+    parts = [p.strip() for p in text.split("|") if p.strip()]
+    if len(parts) < 3:
+        return None, None
+    question = parts[0]
+    options = parts[1:][:10]
+    return question, options
+
+
 def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
-    """Boutons de cible pour diffuser directement le rapport de statistiques."""
+    """Boutons de cible pour diffuser directement le rapport de statistiques, + graphique."""
     keyboard = [
         [InlineKeyboardButton(f"📡 {target}", callback_data=f"statdiff_target_{i}")]
         for i, target in enumerate(BROADCAST_TARGETS)
@@ -948,7 +1045,14 @@ def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
     if BROADCAST_TARGETS:
         keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="statdiff_all")])
     keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="statdiff_subscribers")])
+    keyboard.append([InlineKeyboardButton("📈 Graphique de performance", callback_data="stats_chart")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def filter_entries_by_period(entries: list, days: int) -> list:
+    """Filtre les entrées des `days` derniers jours (basé sur l'heure d'entrée du trade)."""
+    cutoff = datetime.now(TZ) - timedelta(days=days)
+    return [e for e in entries if e.get('entre') and e['entre'] >= cutoff]
 
 
 def get_diffusion_buttons_prompt_keyboard() -> InlineKeyboardMarkup:
@@ -982,7 +1086,8 @@ def get_diffusion_photo_prompt_keyboard() -> InlineKeyboardMarkup:
 def get_diffusion_preview_keyboard() -> InlineKeyboardMarkup:
     """Affiché sous l'aperçu du post, avant confirmation de la diffusion."""
     keyboard = [
-        [styled_button("📤 Diffuser", style="success", callback_data="diffbtn_finish")],
+        [styled_button("📤 Diffuser maintenant", style="success", callback_data="diffbtn_finish")],
+        [InlineKeyboardButton("🕒 Programmer", callback_data="diffbtn_schedule")],
         [InlineKeyboardButton("⚙️ Options", callback_data="diffopt_open")],
         [styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")],
     ]
@@ -1198,45 +1303,72 @@ async def is_channel_member(context: ContextTypes.DEFAULT_TYPE, user_id: int, ch
         return True  # En cas d'erreur (bot pas admin du canal, etc.), on ne pénalise pas le visiteur
 
 
-async def send_channel_reminder(chat_id, context: ContextTypes.DEFAULT_TYPE):
-    """Invite le visiteur à rejoindre le canal, avec un bouton cliquable."""
+LANG_CHOICE_KEYBOARD = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("🇫🇷 Français", callback_data="setlang_fr"),
+        InlineKeyboardButton("🇬🇧 English", callback_data="setlang_en"),
+    ]
+])
+
+
+async def send_channel_reminder(chat_id, context: ContextTypes.DEFAULT_TYPE, lang: str = "fr"):
+    """Invite le visiteur à rejoindre le canal, avec un bouton cliquable (bilingue)."""
     if not CHANNEL_INVITE_LINK:
         return
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📢 Rejoindre le canal", url=CHANNEL_INVITE_LINK)]]
-    )
-    text = (
-        "📢 Pour ne rater aucune stratégie ni aucun signal gratuit, "
-        "rejoins mon canal officiel !"
-    )
+    button_label = "📢 Rejoindre le canal" if lang == "fr" else "📢 Join the channel"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=CHANNEL_INVITE_LINK)]])
+    if lang == "fr":
+        text = "📢 Pour ne rater aucune stratégie ni aucun signal gratuit, rejoins mon canal officiel !"
+    else:
+        text = "📢 To never miss a strategy or a free signal, join my official channel!"
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
 
 
-async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, first_name: str = ""):
+async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, first_name: str = "", lang: str = "fr"):
     """Envoie les deux messages d'accueil à un visiteur (non-administrateur) qui démarre le bot."""
     safe_name = html.escape(first_name) if first_name else ""
     name_part = f" {safe_name}" if safe_name else ""
 
-    text1 = (
-        f"Hey👋{name_part}, <b>bienvenue</b> 😃\n"
-        "Je m'appelle <b>Prince</b> ! Je suis ravi de vous accueillir ici !\n\n"
-        "Je suis <b>trader professionnel des options binaires</b> avec plus de "
-        "<b>10 ans d'expérience</b> ! Je partage mes stratégies de trading "
-        "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je peux t'aider à gagner "
-        "tes premiers <b>1000$</b> dans le trading des options binaires !"
-    )
-    await context.bot.send_message(chat_id=chat_id, text=text1, parse_mode="HTML")
+    if lang == "en":
+        text1 = (
+            f"Hey👋{name_part}, <b>welcome</b> 😃\n"
+            "My name is <b>Prince</b>! I'm delighted to have you here!\n\n"
+            "I'm a <b>professional binary options trader</b> with over "
+            "<b>10 years of experience</b>! I share my trading strategies "
+            "<b>for free</b> in my <b>VIP group</b> and I can help you earn "
+            "your first <b>$1000</b> trading binary options!"
+        )
+        text2 = (
+            "Send me your message and I'll reply <b>as soon as possible</b> ⏱️\n\n"
+            "<b>📝 REGISTRATION</b>\n"
+            f"To join the <b>VIP</b>, you need to sign up on "
+            f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a>.\n"
+            f"Create a new account (<b>30% BONUS</b>), and once registration is complete\n\n"
+            f"❗️<b>SEND YOUR ID</b> from your "
+            f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a> account <b>here</b>\n"
+            "______________________"
+        )
+    else:
+        text1 = (
+            f"Hey👋{name_part}, <b>bienvenue</b> 😃\n"
+            "Je m'appelle <b>Prince</b> ! Je suis ravi de vous accueillir ici !\n\n"
+            "Je suis <b>trader professionnel des options binaires</b> avec plus de "
+            "<b>10 ans d'expérience</b> ! Je partage mes stratégies de trading "
+            "<b>gratuitement</b> dans mon <b>groupe VIP</b> et je peux t'aider à gagner "
+            "tes premiers <b>1000$</b> dans le trading des options binaires !"
+        )
+        text2 = (
+            "Envoie-moi ton message et je te réponds <b>le plus tôt possible</b> ⏱️\n\n"
+            "<b>📝 INSCRIPTION</b>\n"
+            f"Pour rejoindre le <b>VIP</b>, tu dois t'inscrire sur "
+            f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a>.\n"
+            f"Crée un nouveau compte (<b>BONUS DE 30%</b>), et après avoir terminé l'inscription\n\n"
+            f"❗️<b>ENVOIE TON ID</b> depuis ton compte "
+            f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a> <b>ici</b>\n"
+            "______________________"
+        )
 
-    text2 = (
-        "Envoie-moi ton message et je te réponds <b>le plus tôt possible</b> ⏱️\n\n"
-        "<b>📝 INSCRIPTION</b>\n"
-        f"Pour rejoindre le <b>VIP</b>, tu dois t'inscrire sur "
-        f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a>.\n"
-        f"Crée un nouveau compte (<b>BONUS DE 30%</b>), et après avoir terminé l'inscription\n\n"
-        f"❗️<b>ENVOIE TON ID</b> depuis ton compte "
-        f"<a href=\"{POCKET_OPTION_LINK}\"><b>Pocket Option</b></a> <b>ici</b>\n"
-        "______________________"
-    )
+    await context.bot.send_message(chat_id=chat_id, text=text1, parse_mode="HTML")
     await context.bot.send_message(chat_id=chat_id, text=text2, parse_mode="HTML")
 
 
@@ -1251,20 +1383,54 @@ def get_tier_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def is_blocked(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Vérifie si ce chat_id est sur liste noire (/block)."""
+    return chat_id in context.bot_data.get('blocked_users', set())
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /start : accueil personnalisé pour les visiteurs, menu principal pour l'administrateur."""
     chat_id = update.effective_chat.id
-    remember_known_user(context, chat_id)
+
+    if is_blocked(context, chat_id):
+        return  # Utilisateur bloqué (/block) : on l'ignore silencieusement
+
+    visitor_key = make_visitor_key(chat_id, None)
+    known_users_set = context.bot_data.get('known_users', set())
+    is_new_visitor = visitor_key not in known_users_set
+    remember_known_user(context, visitor_key)
     await clear_last_transient(context)
 
     if not is_authorized(chat_id):
         sender = update.effective_user
+
+        if is_new_visitor:
+            context.bot_data.setdefault('visitor_first_seen', {})[visitor_key] = datetime.now(TZ)
+            if ADMIN_CHAT_ID is not None:
+                name = sender.full_name if sender else "Inconnu"
+                username = f"@{sender.username}" if sender and sender.username else "(pas de pseudo)"
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"🆕 Nouveau visiteur : {name} {username} (id: {chat_id})",
+                    )
+                except Exception as e:
+                    logger.warning(f"Échec de notification nouveau visiteur : {e}")
+
+        if context.user_data.get('lang') is None:
+            await update.message.reply_text(
+                "🌍 Choisissez votre langue / Choose your language :",
+                reply_markup=LANG_CHOICE_KEYBOARD,
+            )
+            return
+
+        lang = context.user_data.get('lang', 'fr')
         first_name = sender.first_name if sender and sender.first_name else ""
-        await send_welcome_messages(chat_id, context, first_name)
+        await send_welcome_messages(chat_id, context, first_name, lang=lang)
 
         user_id = sender.id if sender else chat_id
         if not await is_channel_member(context, user_id):
-            await send_channel_reminder(chat_id, context)
+            await send_channel_reminder(chat_id, context, lang=lang)
         return
 
     # Réinitialise tout état de composition en cours (diffusion, capture) pour repartir propre
@@ -1323,6 +1489,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         blocks.append(format_stats_block(f"{icon} VIP {label}", vip_history.get(key, [])))
     blocks.append(format_stats_block("👑 VIP (cumulé)", vip_all_entries))
 
+    all_entries = history + vip_all_entries
+    blocks.append(format_stats_block("📅 7 derniers jours", filter_entries_by_period(all_entries, 7)))
+    blocks.append(format_stats_block("🗓️ 30 derniers jours", filter_entries_by_period(all_entries, 30)))
+
     text = "<b>📊 STATISTIQUES</b>\n\n" + "\n\n".join(blocks)
     remember_broadcast(context, kind='text', text=text, parse_mode="HTML")
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_stats_diffusion_keyboard())
@@ -1341,6 +1511,99 @@ async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
         data['last_broadcast'] = None
         count += 1
     logger.info(f"Réinitialisation quotidienne effectuée pour {count} utilisateur(s).")
+
+
+async def backup_persistence_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job planifié : copie quotidienne du fichier de persistance dans backups/."""
+    try:
+        os.makedirs("backups", exist_ok=True)
+        if os.path.exists(PERSISTENCE_FILE):
+            date_str = datetime.now(TZ).strftime("%Y-%m-%d_%H%M%S")
+            backup_path = os.path.join("backups", f"{os.path.basename(PERSISTENCE_FILE)}.{date_str}.bak")
+            shutil.copy2(PERSISTENCE_FILE, backup_path)
+            logger.info(f"Sauvegarde créée : {backup_path}")
+        else:
+            logger.warning("Aucun fichier de persistance trouvé pour la sauvegarde automatique.")
+    except Exception as e:
+        logger.warning(f"Échec de la sauvegarde automatique : {e}")
+
+
+async def scheduled_diffusion_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job planifié (ponctuel) : envoie une publication programmée à l'heure prévue."""
+    job_data = context.job.data
+    draft = job_data['draft']
+    admin_chat_id = job_data['admin_chat_id']
+
+    if draft['target'] == 'all':
+        destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
+    elif draft['target'] == 'subscribers':
+        known = context.bot_data.get('known_users', set())
+        destinations = []
+        for key in known:
+            d_chat_id, d_topic_id = parse_visitor_key(key)
+            if d_chat_id == ADMIN_CHAT_ID:
+                continue
+            destinations.append((d_chat_id, d_topic_id))
+    else:
+        destinations = [(normalize_broadcast_target(draft['target']), None)]
+
+    sent, failed = 0, 0
+    for dest, dm_topic_id in destinations:
+        try:
+            await send_diffusion_post(context, dest, draft, dm_topic_id=dm_topic_id)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Échec de diffusion programmée vers {dest} : {e}")
+            failed += 1
+
+    try:
+        await context.bot.send_message(
+            chat_id=admin_chat_id,
+            text=f"🕒 Publication programmée envoyée : {sent} réussi(s), {failed} échec(s).",
+        )
+    except Exception as e:
+        logger.warning(f"Échec de notification de diffusion programmée : {e}")
+
+
+async def channel_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job planifié : rappelle de rejoindre le canal aux visiteurs inactifs depuis CHANNEL_REMINDER_DAYS."""
+    if CHANNEL_CHAT_ID is None:
+        return
+
+    known = context.bot_data.get('known_users', set())
+    first_seen = context.bot_data.get('visitor_first_seen', {})
+    reminded = context.bot_data.setdefault('channel_reminder_sent', set())
+    now = datetime.now(TZ)
+    sent = 0
+
+    for key in known:
+        if key in reminded:
+            continue
+        d_chat_id, d_topic_id = parse_visitor_key(key)
+        if d_chat_id == ADMIN_CHAT_ID:
+            continue
+        seen_at = first_seen.get(key)
+        if not seen_at or (now - seen_at).days < CHANNEL_REMINDER_DAYS:
+            continue
+        try:
+            if await is_channel_member(context, d_chat_id):
+                continue
+            extra = {'direct_messages_topic_id': d_topic_id} if d_topic_id is not None else {}
+            if not CHANNEL_INVITE_LINK:
+                continue
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Rejoindre le canal", url=CHANNEL_INVITE_LINK)]])
+            await context.bot.send_message(
+                chat_id=d_chat_id,
+                text="📢 Tu n'as toujours pas rejoint mon canal officiel — ne rate pas les prochains signaux !",
+                reply_markup=keyboard,
+                **extra,
+            )
+            reminded.add(key)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Échec du rappel canal pour {key} : {e}")
+
+    logger.info(f"Rappel canal automatique : {sent} message(s) envoyé(s).")
 
 
 ANALYSIS_ANIMATION_FRAMES = [
@@ -1509,7 +1772,23 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     data = query.data
     chat_id = update.effective_chat.id
-    remember_known_user(context, chat_id)
+
+    if is_blocked(context, chat_id):
+        return  # Utilisateur bloqué (/block) : on l'ignore silencieusement
+
+    remember_known_user(context, make_visitor_key(chat_id, None))
+
+    # Le choix de langue doit rester accessible même aux visiteurs non autorisés
+    if data == "setlang_fr" or data == "setlang_en":
+        lang = 'fr' if data == "setlang_fr" else 'en'
+        context.user_data['lang'] = lang
+        sender = query.from_user
+        first_name = sender.first_name if sender and sender.first_name else ""
+        await send_welcome_messages(chat_id, context, first_name, lang=lang)
+        user_id = sender.id if sender else chat_id
+        if not await is_channel_member(context, user_id):
+            await send_channel_reminder(chat_id, context, lang=lang)
+        return
 
     if not is_authorized(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="⛔ Accès non autorisé.")
@@ -1520,6 +1799,16 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     await clear_last_transient(context)
 
     # --- Navigation générale ---
+
+    if data == "confirm_resetall":
+        context.user_data['history'] = []
+        context.user_data['vip_history'] = empty_vip_history()
+        await send_transient(context, chat_id, text="🗑️ Toutes les statistiques ont été réinitialisées.")
+        return
+
+    if data == "cancel_resetall":
+        await send_transient(context, chat_id, text="Annulé, rien n'a été supprimé.")
+        return
 
     if data == "settier_premium" or data == "settier_standard":
         claimed_premium = data == "settier_premium"
@@ -1680,6 +1969,17 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_signal_action(update, context)
         return
 
+    if data == "stats_chart":
+        history = context.user_data.get('history', [])
+        vip_history = context.user_data.get('vip_history', empty_vip_history())
+        all_entries = history + [e for entries in vip_history.values() for e in entries]
+        if not all_entries:
+            await send_transient(context, chat_id, text="Aucune donnée pour générer un graphique.")
+            return
+        buf = generate_performance_chart(all_entries)
+        await context.bot.send_photo(chat_id=chat_id, photo=buf, caption="📈 Performance par jour")
+        return
+
     if data == "statdiff_all" or data == "statdiff_subscribers" or data.startswith("statdiff_target_"):
         content = context.user_data.get('last_broadcast')
         if not content:
@@ -1720,6 +2020,50 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             context, chat_id,
             text=f"📤 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).",
         )
+        return
+
+    if data == "polltarget_cancel":
+        context.user_data['poll_draft'] = None
+        await send_transient(context, chat_id, text="Sondage annulé.")
+        return
+
+    if data == "polltarget_all" or data == "polltarget_subscribers" or data.startswith("polltarget_idx_"):
+        poll_draft = context.user_data.get('poll_draft')
+        if not poll_draft or not poll_draft.get('question'):
+            await send_transient(context, chat_id, text="Rien à envoyer.")
+            return
+
+        if data == "polltarget_all":
+            destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
+        elif data == "polltarget_subscribers":
+            known = context.bot_data.get('known_users', set())
+            destinations = []
+            for key in known:
+                d_chat_id, d_topic_id = parse_visitor_key(key)
+                if d_chat_id == ADMIN_CHAT_ID:
+                    continue
+                destinations.append((d_chat_id, d_topic_id))
+        else:
+            idx = int(data.replace("polltarget_idx_", ""))
+            if idx < 0 or idx >= len(BROADCAST_TARGETS):
+                await send_transient(context, chat_id, text="Cible invalide.")
+                return
+            destinations = [(normalize_broadcast_target(BROADCAST_TARGETS[idx]), None)]
+
+        sent, failed = 0, 0
+        for dest, dm_topic_id in destinations:
+            try:
+                extra = {'message_thread_id': dm_topic_id} if dm_topic_id is not None else {}
+                await context.bot.send_poll(
+                    chat_id=dest, question=poll_draft['question'], options=poll_draft['options'], **extra,
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Échec d'envoi du sondage vers {dest} : {e}")
+                failed += 1
+
+        context.user_data['poll_draft'] = None
+        await send_transient(context, chat_id, text=f"📊 Sondage envoyé : {sent} réussi(s), {failed} échec(s).")
         return
 
     if data == "btn_diffusion_menu":
@@ -1767,16 +2111,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         draft = context.user_data.get('diffusion_draft')
         if not draft:
             await send_transient(context, chat_id, text="Rien à diffuser.")
-            return
-        if STORAGE_CHANNEL_USERNAME is None:
-            await send_transient(
-                context, chat_id,
-                text=(
-                    "Aucun canal de stockage configuré.\n"
-                    "Renseigne STORAGE_CHANNEL_USERNAME dans le .env (canal PUBLIC, bot admin dessus)."
-                ),
-                reply_markup=get_diffusion_extras_keyboard(),
-            )
             return
         draft['step'] = 'awaiting_storage_photo'
         await send_transient(
@@ -1904,44 +2238,64 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_diffusion_preview(context, chat_id, draft)
         return
 
+    if data == "diffbtn_schedule":
+        draft = context.user_data.get('diffusion_draft')
+        if not draft or (not draft.get('text') and not draft.get('photo_file_id')):
+            await send_transient(context, chat_id, text="Rien à programmer.")
+            return
+        draft['step'] = 'awaiting_schedule_time'
+        await send_transient(
+            context, chat_id,
+            text="🕒 Envoie la date et l'heure d'envoi, au format JJ/MM/AAAA HH:MM (heure locale) :",
+        )
+        return
+
     if data == "diffbtn_finish":
+        if context.user_data.get('diffusion_sending'):
+            await send_transient(context, chat_id, text="⏳ Diffusion déjà en cours, patiente...")
+            return
+
         draft = context.user_data.get('diffusion_draft')
         if not draft or (not draft.get('text') and not draft.get('photo_file_id')):
             await send_transient(context, chat_id, text="Rien à diffuser.")
             return
 
-        if draft['target'] == 'all':
-            destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
-        elif draft['target'] == 'subscribers':
-            known = context.bot_data.get('known_users', set())
-            destinations = []
-            for key in known:
-                d_chat_id, d_topic_id = parse_visitor_key(key)
-                if d_chat_id == ADMIN_CHAT_ID:
-                    continue
-                destinations.append((d_chat_id, d_topic_id))
-        else:
-            destinations = [(normalize_broadcast_target(draft['target']), None)]
+        context.user_data['diffusion_sending'] = True
+        try:
+            if draft['target'] == 'all':
+                destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
+            elif draft['target'] == 'subscribers':
+                known = context.bot_data.get('known_users', set())
+                destinations = []
+                for key in known:
+                    d_chat_id, d_topic_id = parse_visitor_key(key)
+                    if d_chat_id == ADMIN_CHAT_ID:
+                        continue
+                    destinations.append((d_chat_id, d_topic_id))
+            else:
+                destinations = [(normalize_broadcast_target(draft['target']), None)]
 
-        sent, failed = 0, 0
-        all_refs = []
-        for dest, dm_topic_id in destinations:
-            try:
-                refs = await send_diffusion_post(context, dest, draft, dm_topic_id=dm_topic_id)
-                all_refs.extend(refs)
-                sent += 1
-            except Exception as e:
-                logger.warning(f"Échec de diffusion (post libre) vers {dest} : {e}")
-                failed += 1
+            sent, failed = 0, 0
+            all_refs = []
+            for dest, dm_topic_id in destinations:
+                try:
+                    refs = await send_diffusion_post(context, dest, draft, dm_topic_id=dm_topic_id)
+                    all_refs.extend(refs)
+                    sent += 1
+                except Exception as e:
+                    logger.warning(f"Échec de diffusion (post libre) vers {dest} : {e}")
+                    failed += 1
 
-        context.user_data['diffusion_draft'] = None
-        context.user_data['last_diffusion_sent'] = all_refs
+            context.user_data['diffusion_draft'] = None
+            context.user_data['last_diffusion_sent'] = all_refs
 
-        await send_transient(
-            context, chat_id,
-            text=f"📢 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).",
-            reply_markup=get_diffusion_result_keyboard() if all_refs else None,
-        )
+            await send_transient(
+                context, chat_id,
+                text=f"📢 Diffusion terminée : {sent} envoyé(s), {failed} échec(s).",
+                reply_markup=get_diffusion_result_keyboard() if all_refs else None,
+            )
+        finally:
+            context.user_data['diffusion_sending'] = False
         return
 
     if data == "diffdelete_confirm":
@@ -2182,24 +2536,22 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if draft and draft.get('step') == 'awaiting_storage_photo':
-        if STORAGE_CHANNEL_USERNAME is None:
-            await send_transient(context, chat_id, text="Canal de stockage non configuré.")
-            return
         try:
             file_id = message.photo[-1].file_id
-            sent = await context.bot.send_photo(chat_id=f"@{STORAGE_CHANNEL_USERNAME}", photo=file_id)
-            draft['image_url'] = f"https://t.me/{STORAGE_CHANNEL_USERNAME}/{sent.message_id}"
+            tg_file = await context.bot.get_file(file_id)
+            file_bytes = bytes(await tg_file.download_as_bytearray())
+            draft['image_url'] = await upload_to_catbox(file_bytes)
             draft['step'] = 'extras'
             await send_transient(
                 context, chat_id,
-                text="✅ Photo ajoutée. Que veux-tu faire d'autre ?",
+                text="✅ Photo hébergée avec succès. Que veux-tu faire d'autre ?",
                 reply_markup=get_diffusion_extras_keyboard(),
             )
         except Exception as e:
-            logger.warning(f"Échec de stockage de l'image pour diffusion : {e}")
+            logger.warning(f"Échec d'hébergement de l'image pour diffusion : {e}")
             await send_transient(
                 context, chat_id,
-                text=f"❌ Échec de l'envoi vers le canal de stockage : {e}",
+                text=f"❌ Échec de l'hébergement de la photo : {e}",
                 reply_markup=get_diffusion_extras_keyboard(),
             )
         return
@@ -2283,7 +2635,34 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data['history'] = []
             context.user_data['vip_history'] = empty_vip_history()
             await context.bot.send_message(chat_id=chat_id, text="🗑️ Statistiques réinitialisées.")
+        elif action == "poll":
+            context.user_data['poll_draft'] = {'step': 'content'}
+            await send_transient(
+                context, chat_id,
+                text="📊 Envoie ta question et tes options séparées par | (ex: Aimez-vous l'or ? | Oui | Non)",
+            )
         return
+
+    # --- Cas -0.5 : l'admin est en train de composer un sondage ---
+    if is_admin(chat_id):
+        poll_draft = context.user_data.get('poll_draft')
+        if poll_draft and poll_draft.get('step') == 'content':
+            question, options = parse_poll_spec(message.text)
+            if not question:
+                await send_transient(
+                    context, chat_id,
+                    text="⚠️ Format invalide. Utilise : Question | Option1 | Option2 (3 éléments minimum).",
+                )
+                return
+            poll_draft['question'] = question
+            poll_draft['options'] = options
+            poll_draft['step'] = 'target'
+            await send_transient(
+                context, chat_id,
+                text="📊 Choisis où envoyer ce sondage :",
+                reply_markup=get_poll_target_keyboard(),
+            )
+            return
 
     # --- Cas 0 : l'admin est en train de composer un post DIFFUSION ---
     if is_admin(chat_id):
@@ -2313,6 +2692,34 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 draft['buttons'] = rows
                 draft['step'] = 'preview'
                 await show_diffusion_preview(context, chat_id, draft)
+                return
+
+            if step == 'awaiting_schedule_time':
+                try:
+                    target_dt = datetime.strptime(message.text.strip(), "%d/%m/%Y %H:%M").replace(tzinfo=TZ)
+                except ValueError:
+                    await send_transient(
+                        context, chat_id,
+                        text="⚠️ Format invalide. Utilise JJ/MM/AAAA HH:MM (ex: 25/12/2026 18:30).",
+                    )
+                    return
+                if target_dt <= datetime.now(TZ):
+                    await send_transient(context, chat_id, text="⚠️ Cette date est déjà passée. Choisis une heure future.")
+                    return
+                if context.job_queue is None:
+                    await send_transient(context, chat_id, text="⚠️ JobQueue indisponible, impossible de programmer.")
+                    return
+
+                context.job_queue.run_once(
+                    scheduled_diffusion_job, when=target_dt,
+                    data={'draft': dict(draft), 'admin_chat_id': chat_id},
+                    name=f"scheduled_diffusion_{chat_id}_{target_dt.timestamp()}",
+                )
+                context.user_data['diffusion_draft'] = None
+                await send_transient(
+                    context, chat_id,
+                    text=f"✅ Publication programmée pour le {target_dt.strftime('%d/%m/%Y à %H:%M')}.",
+                )
                 return
 
     # --- Cas 1 : message envoyé DANS le groupe de support (dans un topic donné) ---
@@ -2356,6 +2763,10 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # --- Cas 3 : message venant d'un visiteur ---
+
+    if is_blocked(context, chat_id):
+        return  # Utilisateur bloqué (/block) : on l'ignore silencieusement
+
     sender = update.effective_user
     sender_name = sender.full_name if sender else "Inconnu"
     username = f"@{sender.username}" if sender and sender.username else "(pas de pseudo)"
@@ -2366,6 +2777,9 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
     dm_topic = getattr(message, 'direct_messages_topic', None)
     dm_topic_id = dm_topic.topic_id if dm_topic is not None else None
     visitor_key = make_visitor_key(chat_id, dm_topic_id)
+
+    if is_rate_limited(context, visitor_key):
+        return  # Anti-spam : trop de messages en peu de temps, on ignore silencieusement
 
     if ADMIN_CHAT_ID is None and SUPPORT_GROUP_ID is None:
         return  # Aucune des deux fonctionnalités n'est configurée
@@ -2408,6 +2822,73 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.warning(f"Échec de relais du message de {visitor_key} : {e}")
             return
+
+
+async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /block <chat_id> : bloque un visiteur (admin uniquement)."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Réservé à l'administrateur.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage : /block <chat_id>")
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id invalide (doit être un nombre).")
+        return
+    context.bot_data.setdefault('blocked_users', set()).add(target)
+    await update.message.reply_text(f"🚫 {target} a été bloqué.")
+
+
+async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /unblock <chat_id> : débloque un visiteur (admin uniquement)."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Réservé à l'administrateur.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage : /unblock <chat_id>")
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id invalide (doit être un nombre).")
+        return
+    context.bot_data.setdefault('blocked_users', set()).discard(target)
+    await update.message.reply_text(f"✅ {target} a été débloqué.")
+
+
+def is_rate_limited(context: ContextTypes.DEFAULT_TYPE, visitor_key: str) -> bool:
+    """Anti-spam simple : max RATE_LIMIT_MAX_MESSAGES messages par RATE_LIMIT_WINDOW_SECONDS."""
+    now_ts = datetime.now(TZ).timestamp()
+    all_timestamps = context.bot_data.setdefault('rate_limit', {})
+    timestamps = all_timestamps.setdefault(visitor_key, [])
+    cutoff = now_ts - RATE_LIMIT_WINDOW_SECONDS
+    while timestamps and timestamps[0] < cutoff:
+        timestamps.pop(0)
+    if len(timestamps) >= RATE_LIMIT_MAX_MESSAGES:
+        return True
+    timestamps.append(now_ts)
+    return False
+
+
+async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /reset_all : réinitialise tout l'historique, avec double confirmation."""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Réservé à l'administrateur.")
+        return
+    keyboard = InlineKeyboardMarkup([
+        [styled_button("✅ Oui, tout réinitialiser", style="danger", callback_data="confirm_resetall")],
+        [InlineKeyboardButton("❌ Non, annuler", callback_data="cancel_resetall")],
+    ])
+    await update.message.reply_text(
+        "⚠️ Ceci va effacer TOUT l'historique (session gratuite + les 4 sous-sessions VIP). "
+        "Es-tu sûr ?",
+        reply_markup=keyboard,
+    )
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2517,6 +2998,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("historique", history_command))
+    app.add_handler(CommandHandler("reset_all", reset_all_command))
+    app.add_handler(CommandHandler("block", block_command))
+    app.add_handler(CommandHandler("unblock", unblock_command))
     app.add_handler(CallbackQueryHandler(handle_button_click))
     app.add_handler(MessageHandler(filters.PHOTO, handle_capture_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_incoming_message))
@@ -2537,6 +3021,28 @@ def main():
                 time=dt_time(hour=DAILY_RESET_HOUR, minute=0, tzinfo=TZ),
             )
             logger.info(f"Reset quotidien programmé à {DAILY_RESET_HOUR:02d}:00 ({TIMEZONE_NAME}).")
+
+    # Sauvegarde automatique quotidienne (activée par défaut)
+    if BACKUP_ENABLED:
+        if app.job_queue is None:
+            logger.warning("JobQueue indisponible : la sauvegarde automatique ne peut pas être programmée.")
+        else:
+            app.job_queue.run_daily(
+                backup_persistence_job,
+                time=dt_time(hour=BACKUP_HOUR, minute=0, tzinfo=TZ),
+            )
+            logger.info(f"Sauvegarde automatique programmée à {BACKUP_HOUR:02d}:00 ({TIMEZONE_NAME}).")
+
+    # Rappel automatique de canal pour les visiteurs non abonnés (si un canal est configuré)
+    if CHANNEL_CHAT_ID is not None:
+        if app.job_queue is None:
+            logger.warning("JobQueue indisponible : le rappel automatique de canal ne peut pas être programmé.")
+        else:
+            app.job_queue.run_daily(
+                channel_reminder_job,
+                time=dt_time(hour=12, minute=0, tzinfo=TZ),
+            )
+            logger.info(f"Rappel automatique de canal programmé (après {CHANNEL_REMINDER_DAYS} jour(s) d'inactivité).")
 
     logger.info(f"Système détecté : {SYSTEM_OS} (Python {platform.python_version()})")
     logger.info(f"Persistance activée : {PERSISTENCE_FILE}")
