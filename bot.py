@@ -3,13 +3,15 @@ import re
 import html
 import sys
 import io
+import copy
 import shutil
 import asyncio
 import platform
 import random
 import logging
+import subprocess
 from logging.handlers import RotatingFileHandler
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from datetime import datetime, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -32,10 +34,7 @@ from telegram.ext import (
 )
 
 # --- Détection du système d'exploitation ---
-# Le bot fonctionne sur Windows, macOS, Linux et Termux (Android) sans configuration
-# manuelle. Sous Windows, la console n'utilise pas UTF-8 par défaut : sans ce correctif,
-# les accents et emojis dans les logs peuvent provoquer une UnicodeEncodeError.
-SYSTEM_OS = platform.system()  # 'Windows', 'Darwin' (macOS), 'Linux' (dont Termux)
+SYSTEM_OS = platform.system()
 
 if SYSTEM_OS == "Windows":
     try:
@@ -48,7 +47,7 @@ if SYSTEM_OS == "Windows":
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Configuration du Logging : console + fichier persistant (rotatif, 5 Mo x 3 fichiers)
+# Configuration du Logging
 _log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_log_formatter)
@@ -58,15 +57,13 @@ logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handle
 logger = logging.getLogger(__name__)
 
 # --- Fuseau horaire ---
-# Définir TIMEZONE dans le .env (ex: "Europe/Paris", "Africa/Abidjan"). Par défaut : UTC.
 TIMEZONE_NAME = os.getenv("TIMEZONE", "UTC")
 try:
     TZ = ZoneInfo(TIMEZONE_NAME)
 except Exception as e:
     logger.warning(
         f"Fuseau horaire '{TIMEZONE_NAME}' indisponible ({e}). "
-        f"Installez le paquet 'tzdata' (pip install tzdata) pour un support complet. "
-        f"Utilisation d'UTC en secours."
+        f"Installez le paquet 'tzdata' (pip install tzdata). Utilisation d'UTC en secours."
     )
     TZ = timezone.utc
     TIMEZONE_NAME = "UTC"
@@ -75,16 +72,12 @@ except Exception as e:
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_data.pickle")
 
 # --- Restriction d'accès ---
-# Définir ALLOWED_CHAT_IDS dans le .env (ids séparés par des virgules) pour restreindre l'accès.
-# Laisser vide = bot ouvert à tout le monde (comportement par défaut).
 _raw_allowed = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS = {
     int(x.strip()) for x in _raw_allowed.split(",") if x.strip().lstrip("-").isdigit()
 }
 
-# --- Administrateur (relais des messages + broadcast) ---
-# Le chat_id qui recevra les messages des visiteurs et pourra utiliser /broadcast.
-# Si non défini mais qu'un seul ALLOWED_CHAT_IDS est configuré, celui-ci est utilisé automatiquement.
+# --- Administrateur ---
 _admin_env = os.getenv("ADMIN_CHAT_ID", "").strip()
 if _admin_env.lstrip("-").isdigit():
     ADMIN_CHAT_ID = int(_admin_env)
@@ -93,31 +86,23 @@ elif len(ALLOWED_CHAT_IDS) == 1:
 else:
     ADMIN_CHAT_ID = None
 
-# --- Groupe de support avec Topics (fil de discussion par visiteur, optionnel) ---
-# ID du supergroupe (négatif) où les Topics/Sujets sont activés. Le bot doit y être admin
-# avec le droit "Gérer les sujets". Si non configuré, le relais se fait en message privé simple.
+# --- Groupe de support avec Topics ---
 _support_group_env = os.getenv("SUPPORT_GROUP_ID", "").strip()
 SUPPORT_GROUP_ID = int(_support_group_env) if _support_group_env.lstrip("-").isdigit() else None
 
-# --- Reset quotidien automatique (optionnel) ---
+# --- Reset quotidien ---
 DAILY_RESET_ENABLED = os.getenv("DAILY_RESET_ENABLED", "false").lower() == "true"
 DAILY_RESET_HOUR = int(os.getenv("DAILY_RESET_HOUR", "0"))
 
-# --- Timeouts réseau (utile sur connexion lente/instable, ex: données mobiles) ---
+# --- Timeouts réseau ---
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "20"))
 READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "20"))
 
 # --- Diffusion vers canaux/groupes ---
-# Liste des canaux/groupes où le bot peut publier, séparés par des virgules dans le .env.
-# Formats acceptés : "@moncanal" (public) ou "-1001234567890" (id numérique, canal/groupe privé).
-# Le bot doit être administrateur (avec droit de publication) dans chacun d'eux.
 _raw_broadcast = os.getenv("BROADCAST_TARGETS", "")
 BROADCAST_TARGETS = [t.strip() for t in _raw_broadcast.split(",") if t.strip()]
 
-# --- Emojis Telegram Premium (optionnel) ---
-# Format dans le .env : "✅:5368324170671202286,❌:5368324170671202287" (emoji:emoji_id)
-# Récupère chaque emoji_id via un bot comme @idcheckbot en lui envoyant l'emoji premium voulu.
-# Ne s'applique que si l'admin a choisi PREMIUM (et que Telegram confirme ce statut).
+# --- Emojis Telegram Premium ---
 _raw_premium_emoji = os.getenv("PREMIUM_EMOJI_MAP", "").strip()
 PREMIUM_EMOJI_MAP = {}
 for _pair in _raw_premium_emoji.split(","):
@@ -127,11 +112,7 @@ for _pair in _raw_premium_emoji.split(","):
 
 
 def emojify(context: ContextTypes.DEFAULT_TYPE, char: str) -> str:
-    """
-    Retourne la version emoji Telegram Premium animée (balise tg-emoji) de `char` si l'admin
-    est en tier Premium et que son emoji_id est configuré dans PREMIUM_EMOJI_MAP ; sinon,
-    retourne l'emoji normal tel quel. Nécessite parse_mode="HTML" sur le message.
-    """
+    """Retourne la version emoji Telegram Premium animée si applicable."""
     if context.user_data.get('telegram_tier') == 'premium':
         emoji_id = PREMIUM_EMOJI_MAP.get(char)
         if emoji_id:
@@ -139,17 +120,13 @@ def emojify(context: ContextTypes.DEFAULT_TYPE, char: str) -> str:
     return char
 
 
-
 def styled_button(text: str, style: str = None, **kwargs) -> InlineKeyboardButton:
-    """
-    Crée un InlineKeyboardButton coloré (style='danger' rouge, 'success' vert, 'primary' bleu).
-    Fonctionnalité Telegram récente (9 février 2026) : sur un client Telegram plus ancien, le
-    bouton s'affiche simplement sans couleur. Si la librairie python-telegram-bot installée est
-    trop ancienne pour connaître ce paramètre, on retombe automatiquement sur un bouton classique.
-    """
+    """Crée un InlineKeyboardButton coloré avec fallback silencieux loggé."""
     try:
         return InlineKeyboardButton(text, style=style, **kwargs)
-    except TypeError:
+    except TypeError as e:
+        if style:
+            logger.debug(f"Style '{style}' non supporté par cette version : {e}")
         return InlineKeyboardButton(text, **kwargs)
 
 
@@ -161,29 +138,60 @@ def normalize_broadcast_target(target: str):
     return t
 
 
-async def upload_to_catbox(file_bytes: bytes, filename: str = "image.jpg") -> str:
-    """Upload une image sur catbox.moe (hébergeur public, gratuit, sans clé) et retourne son URL directe."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        files = {"fileToUpload": (filename, file_bytes, "image/jpeg")}
-        data = {"reqtype": "fileupload"}
-        resp = await client.post(CATBOX_UPLOAD_URL, data=data, files=files)
-        resp.raise_for_status()
-        url = resp.text.strip()
-        if not url.startswith("http"):
-            raise ValueError(f"Réponse inattendue de catbox.moe : {url}")
-        return url
+# --- Hébergement d'images pour la diffusion (catbox.moe) ---
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
+
+
+async def upload_to_catbox(file_bytes: bytes, filename: str = "image.jpg", retries: int = 3) -> str:
+    """Upload vers catbox.moe avec retry exponentiel."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                files = {"fileToUpload": (filename, file_bytes, "image/jpeg")}
+                data = {"reqtype": "fileupload"}
+                resp = await client.post(CATBOX_UPLOAD_URL, data=data, files=files)
+                resp.raise_for_status()
+                url = resp.text.strip()
+                if not url.startswith("http"):
+                    raise ValueError(f"Réponse inattendue de catbox.moe : {url}")
+                return url
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+    raise last_error
+
 
 # Dossiers d'images
 DIR_IMG = "IMG"
 DIR_WIN = "IMG_WIN"
 DIR_LOSE = "IMG_LOSE"
 
-# Lien d'inscription PocketOption (utilisé dans les signaux et le message d'accueil)
+# 🔧 Dossier temporaire pour la conversion vidéo → note vidéo
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_cercle")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+def _find_ffmpeg() -> str:
+    """Cherche ffmpeg dans le PATH, sinon dans le dossier du bot (Windows : ffmpeg.exe)."""
+    ffmpeg_name = "ffmpeg.exe" if SYSTEM_OS == "Windows" else "ffmpeg"
+    from shutil import which
+    found = which(ffmpeg_name)
+    if found:
+        return found
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), ffmpeg_name)
+    if os.path.exists(local):
+        return local
+    return ffmpeg_name
+
+
+FFMPEG_PATH = _find_ffmpeg()
+
+# Lien d'inscription
 POCKET_OPTION_LINK = "https://bit.ly/4ckz9cY"
 
-# --- Canal Telegram à promouvoir (optionnel) ---
-# CHANNEL_CHAT_ID : @username (canal public) ou id numérique négatif (canal privé).
-# Le bot doit être administrateur de ce canal pour pouvoir vérifier qui y est abonné.
+# --- Canal Telegram à promouvoir ---
 _channel_env = os.getenv("CHANNEL_CHAT_ID", "").strip()
 if _channel_env.lstrip("-").isdigit():
     CHANNEL_CHAT_ID = int(_channel_env)
@@ -192,15 +200,11 @@ elif _channel_env:
 else:
     CHANNEL_CHAT_ID = None
 
-# Lien affiché sur le bouton "Rejoindre le canal". Déduit automatiquement si CHANNEL_CHAT_ID
-# est un @username public ; à renseigner manuellement (lien d'invitation) si le canal est privé.
 CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
 if not CHANNEL_INVITE_LINK and isinstance(CHANNEL_CHAT_ID, str) and CHANNEL_CHAT_ID.startswith("@"):
     CHANNEL_INVITE_LINK = f"https://t.me/{CHANNEL_CHAT_ID[1:]}"
 
-# --- Canal/groupe VIP (optionnel, distinct du canal ci-dessus) ---
-# Utilisé pour le bouton "ABONNÉS NON VIP" : identifie qui n'est PAS encore dans le VIP.
-# @username (public) ou id numérique négatif (privé). Le bot doit y être administrateur.
+# --- Canal/groupe VIP ---
 _vip_channel_env = os.getenv("VIP_CHANNEL_CHAT_ID", "").strip()
 if _vip_channel_env.lstrip("-").isdigit():
     VIP_CHANNEL_CHAT_ID = int(_vip_channel_env)
@@ -209,26 +213,19 @@ elif _vip_channel_env:
 else:
     VIP_CHANNEL_CHAT_ID = None
 
-# --- Hébergement d'images pour la diffusion (catbox.moe, aucune clé requise) ---
-# Utilisé par le bouton "➕ Ajouter photo" : l'image est uploadée sur catbox.moe (hébergeur
-# public gratuit) puis son URL directe est cachée dans un lien invisible du texte, pour générer
-# un aperçu agrandi sous le message via LinkPreviewOptions.
-CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
-
 # --- Anti-spam visiteurs ---
 RATE_LIMIT_MAX_MESSAGES = int(os.getenv("RATE_LIMIT_MAX_MESSAGES", "5"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
-# --- Sauvegarde automatique de la persistance ---
+# --- Sauvegarde automatique ---
 BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "true").lower() == "true"
 BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "3"))
 
-# --- Rappel automatique de canal (pour les visiteurs non abonnés) ---
+# --- Rappel canal ---
 CHANNEL_REMINDER_DAYS = int(os.getenv("CHANNEL_REMINDER_DAYS", "3"))
 
 # Liste complète des paires OTC
 ACTIFS = [
-    # Paires à 92%
     "🇦🇺 AUD/CAD 🇨🇦OTC", "🇨🇦 CAD/CHF 🇨🇭OTC", "🇨🇦 CAD/JPY 🇯🇵OTC", "🇨🇭 CHF/NOK 🇳🇴OTC",
     "🇪🇺 EUR/CHF 🇨🇭OTC", "🇪🇺 EUR/TRY 🇹🇷OTC", "🇪🇺 EUR/USD 🇺🇸OTC", "🇬🇧 GBP/AUD 🇦🇺OTC",
     "🇬🇧 GBP/JPY 🇯🇵OTC", "🇬🇧 GBP/USD 🇺🇸OTC", "🇰🇪 KES/USD 🇺🇸OTC", "🇳🇿 NZD/USD 🇺🇸OTC",
@@ -236,34 +233,22 @@ ACTIFS = [
     "🇺🇸 USD/CAD 🇨🇦OTC", "🇺🇸 USD/CHF 🇨🇭OTC", "🇺🇸 USD/CLP 🇨🇱OTC", "🇺🇸 USD/COP 🇨🇴OTC",
     "🇺🇸 USD/EGP 🇪🇬OTC", "🇺🇸 USD/IDR 🇮🇩OTC", "🇺🇸 USD/PHP 🇵🇭OTC", "🇺🇸 USD/RUB 🇷🇺OTC",
     "🇺🇸 USD/THB 🇹🇭OTC", "🇾🇪 YER/USD 🇺🇸OTC",
-
-    # Paires de 85% à 91%
     "🇴🇲 OMR/CNY 🇨🇳OTC", "🇺🇸 USD/BDT 🇧🇩OTC", "🇺🇸 USD/MXN 🇲🇽OTC", "🇪🇺 EUR/NZD 🇳🇿OTC",
     "🇪🇺 EUR/JPY 🇯🇵OTC", "🇧🇭 BHD/CNY 🇨🇳OTC",
-
-    # Paires de 75% à 84%
     "🇦🇪 AED/CNY 🇨🇳OTC", "🇦🇺 AUD/NZD 🇳🇿OTC", "🇦🇺 AUD/CHF 🇨🇭OTC", "🇦🇺 AUD/JPY 🇯🇵OTC",
     "🇳🇬 NGN/USD 🇺🇸OTC", "🇨🇭 CHF/JPY 🇯🇵OTC", "🇲🇦 MAD/USD 🇺🇸OTC", "🇶🇦 QAR/CNY 🇨🇳OTC",
     "🇺🇸 USD/SGD 🇸🇬OTC", "🇺🇸 USD/ARS 🇦🇷OTC", "🇪🇺 EUR/RUB 🇷🇺OTC", "🇺🇸 USD/CNH 🇨🇳OTC",
     "🇺🇸 USD/JPY 🇯🇵OTC",
-
-    # Paires de 65% à 74%
     "🇳🇿 NZD/JPY 🇯🇵OTC", "🇺🇸 USD/VND 🇻🇳OTC", "🇺🇸 USD/MYR 🇲🇾OTC", "🇿🇦 ZAR/USD 🇺🇸OTC",
     "🇦🇺 AUD/USD 🇺🇸OTC", "🇪🇺 EUR/GBP 🇬🇧OTC", "🇺🇸 USD/PKR 🇵🇰OTC", "🇺🇸 USD/DZD 🇩ℤOTC",
-
-    # Paires inférieures à 65%
     "🇪🇺 EUR/HUF 🇭🇺OTC", "🇱🇧 LBP/USD 🇺🇸OTC", "🇯🇴 JOD/CNY 🇨🇳OTC", "🇺🇸 USD/INR 🇮🇳OTC"
 ]
 
-# --- Constantes pour le BILAN ---
-JOURS_FR = {
-    0: "LUNDI", 1: "MARDI", 2: "MERCREDI", 3: "JEUDI",
-    4: "VENDREDI", 5: "SAMEDI", 6: "DIMANCHE"
-}
+# --- Constantes BILAN ---
+JOURS_FR = {0: "LUNDI", 1: "MARDI", 2: "MERCREDI", 3: "JEUDI", 4: "VENDREDI", 5: "SAMEDI", 6: "DIMANCHE"}
 MOIS_FR = {
-    1: "janvier", 2: "février", 3: "mars", 4: "avril",
-    5: "mai", 6: "juin", 7: "juillet", 8: "août",
-    9: "septembre", 10: "octobre", 11: "novembre", 12: "décembre"
+    1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai", 6: "juin",
+    7: "juillet", 8: "août", 9: "septembre", 10: "octobre", 11: "novembre", 12: "décembre"
 }
 EXPOSANTS = {"mg0": "⁰", "mg1": "¹", "mg2": "²", "mg3": "³"}
 TIME_KEY_FOR_RESULT = {"mg0": "entre", "mg1": "mg1", "mg2": "mg2", "mg3": "mg3", "lose": "entre"}
@@ -272,7 +257,7 @@ DIGIT_EMOJIS = {
     '5': '5️⃣', '6': '6️⃣', '7': '7️⃣', '8': '8️⃣', '9': '9️⃣'
 }
 
-# --- Constantes pour la SESSION VIP ---
+# --- Constantes SESSION VIP ---
 VIP_SESSION_ORDER = ["matin", "midi", "soir", "nuit"]
 VIP_SESSION_LABELS = {
     "matin": ("🌅", "MATIN"),
@@ -283,36 +268,26 @@ VIP_SESSION_LABELS = {
 
 
 def empty_vip_history() -> dict:
-    """Retourne un dictionnaire d'historique VIP vide pour les 4 sous-sessions."""
     return {key: [] for key in VIP_SESSION_ORDER}
 
 
 def is_authorized(chat_id: int) -> bool:
-    """Vérifie si le chat_id est autorisé. Si ALLOWED_CHAT_IDS est vide, tout le monde est autorisé."""
     if not ALLOWED_CHAT_IDS:
         return True
     return chat_id in ALLOWED_CHAT_IDS
 
 
 def is_admin(chat_id: int) -> bool:
-    """Vérifie si le chat_id est celui de l'administrateur configuré."""
     return ADMIN_CHAT_ID is not None and chat_id == ADMIN_CHAT_ID
 
 
 def make_visitor_key(chat_id: int, dm_topic_id=None) -> str:
-    """
-    Construit la clé identifiant un visiteur. Pour un chat privé classique, c'est simplement
-    le chat_id. Pour un visiteur ayant écrit via les "Messages directs" d'un canal, plusieurs
-    personnes partagent le même chat_id (celui du canal) : on y ajoute alors le topic_id
-    (propre à chaque abonné) pour ne jamais les confondre.
-    """
     if dm_topic_id is None:
         return str(chat_id)
     return f"{chat_id}:{dm_topic_id}"
 
 
 def parse_visitor_key(key: str):
-    """Extrait (chat_id, dm_topic_id) d'une clé visiteur. dm_topic_id vaut None si absent."""
     key = str(key)
     if ":" in key:
         chat_part, topic_part = key.split(":", 1)
@@ -321,32 +296,24 @@ def parse_visitor_key(key: str):
 
 
 def remember_known_user(context: ContextTypes.DEFAULT_TYPE, visitor_key: str):
-    """Ajoute cette clé visiteur à la liste des utilisateurs connus, pour permettre le /broadcast."""
     known = context.bot_data.setdefault('known_users', set())
     known.add(visitor_key)
 
 
 def log_conversation(context: ContextTypes.DEFAULT_TYPE, visitor_key: str, sender: str, text: str):
-    """Enregistre un message échangé avec un visiteur (pour la commande /historique)."""
     log = context.bot_data.setdefault('conversation_log', {})
     entries = log.setdefault(visitor_key, [])
     entries.append({
-        'from': sender,  # 'visitor' ou 'admin'
+        'from': sender,
         'text': text,
         'time': datetime.now(TZ),
     })
-    # Limite pour éviter une croissance illimitée de la mémoire
     if len(entries) > 200:
         del entries[:len(entries) - 200]
 
 
 async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, visitor_key: str,
                                sender_name: str, username: str):
-    """
-    Retourne le message_thread_id du topic dédié à ce visiteur dans le groupe de support,
-    en le créant s'il n'existe pas encore. Retourne None si SUPPORT_GROUP_ID n'est pas
-    configuré ou si la création échoue (groupe sans Topics activés, bot non admin, etc.).
-    """
     if SUPPORT_GROUP_ID is None:
         return None
 
@@ -379,22 +346,21 @@ async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, visitor_key: s
 
 
 def remember_broadcast(context: ContextTypes.DEFAULT_TYPE, *, kind: str, text: str = None,
-                        photo_file_id: str = None, parse_mode: str = None):
-    """Mémorise le dernier contenu envoyé en privé (signal ou résultat), pour la diffusion automatique."""
+                        photo_file_id: str = None, video_file_id: str = None,
+                        video_note_file_id: str = None, parse_mode: str = None):
+    """Mémorise le dernier contenu envoyé pour la diffusion automatique."""
     context.user_data['last_broadcast'] = {
-        'kind': kind,  # 'photo' ou 'text'
+        'kind': kind,
         'text': text,
         'photo_file_id': photo_file_id,
+        'video_file_id': video_file_id,
+        'video_note_file_id': video_note_file_id,
         'parse_mode': parse_mode,
     }
 
 
 async def auto_broadcast_last(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Diffuse automatiquement le dernier contenu (signal ou résultat) vers la cible choisie
-    pour cette session (context.user_data['active_broadcast_target']), sans intervention
-    manuelle. Ne fait rien si aucune cible n'a été choisie pour cette session.
-    """
+    """Diffuse automatiquement le dernier contenu vers la cible active de la session."""
     target_setting = context.user_data.get('active_broadcast_target')
     if not target_setting:
         return
@@ -410,19 +376,23 @@ async def auto_broadcast_last(context: ContextTypes.DEFAULT_TYPE):
         try:
             if content['kind'] == 'photo' and content.get('photo_file_id'):
                 sent = await context.bot.send_photo(
-                    chat_id=dest,
-                    photo=content['photo_file_id'],
-                    caption=content.get('text'),
-                    parse_mode=content.get('parse_mode'),
+                    chat_id=dest, photo=content['photo_file_id'],
+                    caption=content.get('text'), parse_mode=content.get('parse_mode'),
+                )
+            elif content['kind'] == 'video' and content.get('video_file_id'):
+                sent = await context.bot.send_video(
+                    chat_id=dest, video=content['video_file_id'],
+                    caption=content.get('text'), parse_mode=content.get('parse_mode'),
+                )
+            elif content['kind'] == 'video_note' and content.get('video_note_file_id'):
+                sent = await context.bot.send_video_note(
+                    chat_id=dest, video_note=content['video_note_file_id'],
                 )
             else:
                 sent = await context.bot.send_message(
-                    chat_id=dest,
-                    text=content.get('text') or '',
-                    parse_mode=content.get('parse_mode'),
-                    disable_web_page_preview=True,
+                    chat_id=dest, text=content.get('text') or '',
+                    parse_mode=content.get('parse_mode'), disable_web_page_preview=True,
                 )
-            # Mémorise cette copie pour pouvoir la supprimer via ANNULER DERNIER
             trade = context.user_data.get('current_trade')
             if trade is not None:
                 trade.setdefault('broadcasts', []).append((sent.chat_id, sent.message_id))
@@ -438,14 +408,7 @@ _BUTTON_STYLE_WORDS = {
 
 
 def parse_diffusion_buttons(text: str):
-    """
-    Parse le format de boutons façon Controller Bot :
-        Texte bouton 1 - http://exemple.com | Texte bouton 2 - http://exemple2.com - style:red
-        Texte bouton 3 - http://exemple3.com
-    Chaque ligne = une rangée de boutons ; "|" sépare les boutons d'une même rangée.
-    Retourne une liste de rangées, chaque rangée étant une liste de tuples (label, url, style).
-    Les entrées mal formées sont simplement ignorées.
-    """
+    """Parse le format de boutons façon Controller Bot (regex robuste aux tirets)."""
     rows = []
     for line in text.strip().splitlines():
         line = line.strip()
@@ -463,12 +426,12 @@ def parse_diffusion_buttons(text: str):
                 style = _BUTTON_STYLE_WORDS.get(style_match.group(1).lower())
                 part = part[:style_match.start()].rstrip()
 
-            if " - " not in part:
+            url_match = re.search(r'\s+-\s+(https?://\S+)', part)
+            if not url_match:
                 continue
-            label, url = part.rsplit(" - ", 1)
-            label = label.strip()
-            url = url.strip()
-            if not label or not (url.startswith("http://") or url.startswith("https://")):
+            url = url_match.group(1).strip()
+            label = part[:url_match.start()].strip()
+            if not label:
                 continue
             row.append((label, url, style))
 
@@ -482,12 +445,7 @@ RANDOM_BUTTON_STYLES = ["success", "danger", "primary"]
 
 
 def build_diffusion_markup(button_rows: list):
-    """
-    Construit un InlineKeyboardMarkup à partir de rangées de boutons (label, url, style).
-    Couleur aléatoire par rangée : tous les boutons d'une même rangée partagent la même
-    couleur (choisie au hasard), sauf si un style a été explicitement précisé (style:xxx)
-    pour un bouton donné, auquel cas ce choix explicite est respecté.
-    """
+    """Construit un InlineKeyboardMarkup à partir des rangées."""
     if not button_rows:
         return None
     keyboard = []
@@ -500,21 +458,79 @@ def build_diffusion_markup(button_rows: list):
     return InlineKeyboardMarkup(keyboard)
 
 
+# 🔧 Conversion vidéo normale → note vidéo (cercle) via FFmpeg
+def convertir_en_cercle(input_path: str, output_path: str) -> bool:
+    """
+    Convertit une vidéo en format 'video note' (cercle) compatible Telegram.
+    - Recadre en carré (1:1)
+    - Redimensionne à 384x384
+    - Limite à 60 secondes
+    - Encode en H.264 + AAC
+    """
+    cmd = [
+        FFMPEG_PATH, "-y",
+        "-i", input_path,
+        "-t", "60",
+        "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=384:384",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "28",
+        "-c:a", "aac",
+        "-b:a", "64k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        logger.warning(
+            "❌ FFmpeg introuvable. Installe-le :\n"
+            "  - Termux : pkg install ffmpeg\n"
+            "  - Linux : sudo apt install ffmpeg\n"
+            "  - macOS : brew install ffmpeg\n"
+            "  - Windows : télécharge ffmpeg.exe et place-le dans le dossier du bot"
+        )
+        return False
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Erreur ffmpeg : {e}")
+        return False
+
+
+async def download_and_convert_to_video_note(
+    context: ContextTypes.DEFAULT_TYPE, file_id: str, message_id: int
+):
+    """
+    Télécharge un fichier Telegram et le convertit en note vidéo (cercle).
+    Retourne le chemin du fichier converti, ou None en cas d'échec.
+    """
+    input_path = os.path.join(TEMP_DIR, f"in_{message_id}.mp4")
+    output_path = os.path.join(TEMP_DIR, f"out_{message_id}.mp4")
+
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(input_path)
+
+        success = await asyncio.to_thread(convertir_en_cercle, input_path, output_path)
+        if not success:
+            return None
+        return output_path
+    except Exception as e:
+        logger.warning(f"Échec téléchargement/conversion en note vidéo : {e}")
+        return None
+    finally:
+        if os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
+
+
 async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: dict, dm_topic_id=None) -> list:
     """
-    Envoie le post composé via DIFFUSION vers une destination, en appliquant les options
-    choisies (formatage, diffusion silencieuse, aperçu du lien). Trois cas possibles :
-    - Photo uploadée directement (photo_file_id) : photo + légende classique, boutons dessus.
-    - Image via canal de stockage (image_url, un lien https://t.me/canal/id) : envoyée en
-      send_message, avec un lien invisible (caractère zéro-largeur) pointant vers cette image,
-      et LinkPreviewOptions pour afficher l'aperçu en grand format SOUS le texte.
-    - Texte seul : send_message classique, aperçu de lien standard.
-    `dm_topic_id` est nécessaire pour un visiteur ayant écrit via les "Messages directs"
-    d'un canal. Retourne la liste des (chat_id, message_id) effectivement envoyés.
-
-    Note : "Réactions par défaut" est une préférence purement indicative — l'API des bots
-    Telegram ne permet pas d'activer/désactiver les réactions sur un message envoyé par un
-    bot ; ce réglage est géré au niveau du chat lui-même, pas par message.
+    Envoie le post composé via DIFFUSION vers une destination.
+    Supporte : photo, vidéo, note vidéo (cercle), texte seul.
     """
     options = draft.get('options') or DEFAULT_DIFFUSION_OPTIONS
     raw_text = draft.get('text')
@@ -528,14 +544,27 @@ async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: d
 
     markup = build_diffusion_markup(draft.get('buttons'))
     photo_file_id = draft.get('photo_file_id')
+    video_file_id = draft.get('video_file_id')
+    video_note_file_id = draft.get('video_note_file_id')
     image_url = draft.get('image_url')
     sent_refs = []
     extra = {'disable_notification': options.get('silent', False)}
     if dm_topic_id is not None:
         extra['direct_messages_topic_id'] = dm_topic_id
 
-    if photo_file_id:
-        # Photo uploadée directement : légende et boutons dans le même message
+    # Priorité : note vidéo > vidéo > photo > texte
+    if video_note_file_id:
+        sent_vn = await context.bot.send_video_note(
+            chat_id=dest, video_note=video_note_file_id, **extra,
+        )
+        sent_refs.append((sent_vn.chat_id, sent_vn.message_id))
+    elif video_file_id:
+        sent_video = await context.bot.send_video(
+            chat_id=dest, video=video_file_id, caption=text, parse_mode=parse_mode,
+            reply_markup=markup, **extra,
+        )
+        sent_refs.append((sent_video.chat_id, sent_video.message_id))
+    elif photo_file_id:
         sent_photo = await context.bot.send_photo(
             chat_id=dest, photo=photo_file_id, caption=text, parse_mode=parse_mode,
             reply_markup=markup, **extra,
@@ -544,9 +573,6 @@ async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: d
     else:
         final_text = text or ''
         if image_url and parse_mode == "HTML":
-            # Lien invisible (caractère zéro-largeur) vers l'image archivée dans le canal
-            # de stockage : Telegram génère l'aperçu à partir de cette URL, affiché en
-            # grand format sous le texte grâce à LinkPreviewOptions.
             final_text += f'<a href="{image_url}">\u200b</a>'
             preview_options = LinkPreviewOptions(
                 is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False,
@@ -567,7 +593,7 @@ async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: d
 
 
 async def show_diffusion_preview(context: ContextTypes.DEFAULT_TYPE, chat_id, draft: dict):
-    """Envoie un aperçu exact du post (dans le chat de l'admin) avant confirmation de diffusion."""
+    """Envoie un aperçu exact du post avant confirmation."""
     try:
         await send_diffusion_post(context, chat_id, draft)
     except Exception as e:
@@ -581,8 +607,7 @@ async def show_diffusion_preview(context: ContextTypes.DEFAULT_TYPE, chat_id, dr
 
 
 async def diffuse_capture_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str):
-    """Diffuse une capture d'écran (envoyée via le bouton CAPTURE) vers la cible active de la session,
-    avec un bouton "PARTAGEZ VOS RÉSULTATS" pointant vers le bot."""
+    """Diffuse une capture d'écran vers la cible active."""
     target_setting = context.user_data.get('active_broadcast_target')
     if not target_setting:
         return
@@ -601,7 +626,6 @@ async def diffuse_capture_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_i
 
 
 def get_asset_filename(asset_string: str) -> str:
-    """Transforme '🇪🇺 EUR/CHF 🇨🇭OTC' en 'eurchf_otc' de manière propre."""
     clean_text = re.sub(r'[^a-zA-Z0-9]', '', asset_string).lower()
     if clean_text.endswith("otc"):
         clean_text = clean_text[:-3] + "_otc"
@@ -609,31 +633,22 @@ def get_asset_filename(asset_string: str) -> str:
 
 
 def get_random_jpeg(directory: str):
-    """Récupère une image aléatoire (supporte .jpg, .jpeg, .png, .heic)."""
     if not os.path.exists(directory):
         os.makedirs(directory, exist_ok=True)
         return None
 
     valid_extensions = ('.jpeg', '.jpg', '.png', '.heic')
-    jpegs = [
-        f for f in os.listdir(directory)
-        if f.lower().endswith(valid_extensions)
-    ]
+    jpegs = [f for f in os.listdir(directory) if f.lower().endswith(valid_extensions)]
     if not jpegs:
         return None
     return os.path.join(directory, random.choice(jpegs))
 
 
 def get_specific_jpeg_only(directory: str, asset_filename: str):
-    """
-    Scanne le dossier et trouve l'image correspondant à asset_filename,
-    insensible aux majuscules/minuscules (.JPG, .jpg, .png, .heic).
-    """
     if not os.path.exists(directory) or not asset_filename:
         return None
 
     valid_extensions = ('.jpg', '.jpeg', '.png', '.heic')
-
     for file in os.listdir(directory):
         file_name_without_ext, file_ext = os.path.splitext(file)
         if file_name_without_ext.lower() == asset_filename.lower() and file_ext.lower() in valid_extensions:
@@ -643,7 +658,6 @@ def get_specific_jpeg_only(directory: str, asset_filename: str):
 
 
 def generate_signal_data():
-    """Génère les données temporelles d'un signal. L'heure d'entrée tombe toujours sur une minute paire."""
     actif = random.choice(ACTIFS)
     direction = random.choice(["ACHAT", "VENTE"])
     now = datetime.now(TZ)
@@ -666,7 +680,6 @@ def generate_signal_data():
 
 
 def format_signal_text(signal: dict) -> str:
-    """Formate le texte du signal."""
     lien_video = "https://t.me/LegitTrade_academy"
     lien_inscription = POCKET_OPTION_LINK
 
@@ -687,7 +700,6 @@ ______________________________
 
 
 def to_two_digit_emoji(n: int) -> str:
-    """Transforme un entier en 2 chiffres emoji (ex: 3 -> 0️⃣3️⃣)."""
     s = f"{n:02d}"
     return "".join(DIGIT_EMOJIS[c] for c in s)
 
@@ -697,7 +709,6 @@ def format_bilan_text(
     header_title: str = "RAPPORT SESSION GRATUITE",
     blockquote_title: str = "🌑 Session gratuite",
 ) -> str:
-    """Formate le texte du bilan d'une session, dans le style de la capture d'écran."""
     now = datetime.now(TZ)
     jour_nom = JOURS_FR[now.weekday()]
     date_str = f"{now.day} {MOIS_FR[now.month]} {now.year}"
@@ -730,10 +741,6 @@ def format_bilan_text(
 
 
 def format_full_vip_report(vip_history: dict) -> str:
-    """
-    Formate le rapport complet VIP : un bloc par sous-session (matin/midi/soir/nuit)
-    dans le style de la capture d'écran (DAILY REPORT), suivi du total global.
-    """
     now = datetime.now(TZ)
     jour_nom = JOURS_FR[now.weekday()]
     date_str = f"{now.day} {MOIS_FR[now.month]} {now.year}"
@@ -770,7 +777,15 @@ def format_full_vip_report(vip_history: dict) -> str:
 
 
 def generate_performance_chart(entries: list):
-    """Génère un graphique PNG (BytesIO) du taux de réussite par jour."""
+    """Génère un graphique PNG (import paresseux de matplotlib)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib non installé : graphique indisponible.")
+        return None
+
     daily = {}
     for e in entries:
         if not e.get('entre'):
@@ -801,7 +816,6 @@ def generate_performance_chart(entries: list):
 
 
 def compute_stats(entries: list) -> dict:
-    """Calcule les statistiques (taux de réussite, meilleur/pire actif) sur une liste de trades."""
     total = len(entries)
     gains = sum(1 for e in entries if e['result'] != 'lose')
     pertes = total - gains
@@ -826,17 +840,13 @@ def compute_stats(entries: list) -> dict:
             worst_net, worst_asset = net, actif
 
     return {
-        'total': total,
-        'gains': gains,
-        'pertes': pertes,
-        'taux': taux,
+        'total': total, 'gains': gains, 'pertes': pertes, 'taux': taux,
         'best_asset': best_asset if best_net and best_net > 0 else None,
         'worst_asset': worst_asset if worst_net is not None and worst_net < 0 else None,
     }
 
 
 def format_stats_block(title: str, entries: list) -> str:
-    """Formate un bloc de statistiques pour une session ou sous-session donnée."""
     stats = compute_stats(entries)
     if stats['total'] == 0:
         return f"<b>{title}</b>\nAucun trade enregistré."
@@ -855,7 +865,7 @@ def format_stats_block(title: str, entries: list) -> str:
     return "\n".join(lines)
 
 
-# --- CLAVIERS INLINE ---
+# --- CLAVIERS ---
 
 ADMIN_QUICK_KEYBOARD = ReplyKeyboardMarkup(
     [["🏠 Menu", "📊 Stats"], ["📢 Diffusion", "ℹ️ Aide"], ["📊 Sondage", "🗑️ RESET STATS"]],
@@ -873,7 +883,6 @@ ADMIN_QUICK_ACTIONS = {
 
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Menu principal : choix entre session gratuite, session VIP et diffusion libre."""
     keyboard = [
         [
             InlineKeyboardButton("🆓 SESSION GRATUITE", callback_data="btn_free_menu"),
@@ -885,13 +894,11 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_free_start_keyboard() -> InlineKeyboardMarkup:
-    """Bouton SIGNAL uniquement, affiché après le choix de la session gratuite."""
     keyboard = [[InlineKeyboardButton("SIGNAL", callback_data="btn_get_signal")]]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_signal_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
-    """Boutons CAPTURE, BILAN et ANNULER (optionnel) (session gratuite)."""
     keyboard = [
         [
             styled_button("📸 CAPTURE", style="primary", callback_data="btn_capture"),
@@ -904,7 +911,6 @@ def get_signal_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
 
 
 def get_result_keyboard() -> InlineKeyboardMarkup:
-    """Boutons de résultat sous le signal, + bouton NEW et DIFFUSER (manuel). Utilisé en gratuit et en VIP."""
     keyboard = [
         [
             styled_button("MG0", style="success", callback_data="res_mg0"),
@@ -913,16 +919,13 @@ def get_result_keyboard() -> InlineKeyboardMarkup:
             styled_button("MG3", style="success", callback_data="res_mg3"),
             styled_button("❌", style="danger", callback_data="res_lose"),
         ],
-        [
-            InlineKeyboardButton("🔄 NEW", callback_data="btn_new"),
-        ],
+        [InlineKeyboardButton("🔄 NEW", callback_data="btn_new")],
         [styled_button("📤 DIFFUSER", style="primary", callback_data="btn_broadcast_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_bilan_keyboard() -> InlineKeyboardMarkup:
-    """Boutons NEW SESSION et MENU PRINCIPAL, affichés sous le bilan gratuit."""
     keyboard = [
         [InlineKeyboardButton("NEW SESSION", callback_data="btn_new_session")],
         [InlineKeyboardButton("🏠 MENU PRINCIPAL", callback_data="btn_main_menu")],
@@ -931,7 +934,6 @@ def get_bilan_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_vip_menu_keyboard() -> InlineKeyboardMarkup:
-    """Menu VIP : choix libre de la sous-session + rapport complet + retour."""
     keyboard = [
         [
             InlineKeyboardButton("🌅 MATIN", callback_data="vip_matin"),
@@ -948,7 +950,6 @@ def get_vip_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_vip_signal_start_keyboard() -> InlineKeyboardMarkup:
-    """Bouton SIGNAL + retour au menu VIP, affiché en entrant dans une sous-session."""
     keyboard = [
         [InlineKeyboardButton("SIGNAL", callback_data="btn_get_signal")],
         [InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")],
@@ -957,7 +958,6 @@ def get_vip_signal_start_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_vip_result_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
-    """Boutons CAPTURE / BILAN / ANNULER (optionnel) / MENU VIP, après un résultat en session VIP."""
     keyboard = [
         [
             styled_button("📸 CAPTURE", style="primary", callback_data="btn_capture"),
@@ -971,7 +971,6 @@ def get_vip_result_keyboard(include_undo: bool = True) -> InlineKeyboardMarkup:
 
 
 def get_vip_bilan_keyboard(session_key: str) -> InlineKeyboardMarkup:
-    """Boutons affichés sous le bilan d'une sous-session VIP."""
     keyboard = [
         [InlineKeyboardButton("🔄 RECOMMENCER CETTE SESSION", callback_data=f"vip_reset_{session_key}")],
         [InlineKeyboardButton("👥 ABONNÉS NON VIP", callback_data=f"vipnonvip_{session_key}")],
@@ -981,15 +980,11 @@ def get_vip_bilan_keyboard(session_key: str) -> InlineKeyboardMarkup:
 
 
 def get_vip_rapport_keyboard() -> InlineKeyboardMarkup:
-    """Bouton retour, affiché sous le rapport complet VIP."""
-    keyboard = [
-        [InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")],
-    ]
+    keyboard = [[InlineKeyboardButton("⬅️ MENU VIP", callback_data="btn_vip_menu")]]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_session_broadcast_choice_keyboard() -> InlineKeyboardMarkup:
-    """Choix de la cible de diffusion pour toute la session (signal + résultat, automatique ensuite)."""
     keyboard = [
         [InlineKeyboardButton(f"📡 {target}", callback_data=f"setbcast_target_{i}")]
         for i, target in enumerate(BROADCAST_TARGETS)
@@ -1000,8 +995,17 @@ def get_session_broadcast_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_subscribers_submenu_keyboard(prefix: str, cancel_callback: str) -> InlineKeyboardMarkup:
+    """Sous-menu des abonnés : VIP / NON VIP / TOUS."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👑 VIP", callback_data=f"{prefix}_vip_only")],
+        [InlineKeyboardButton("🆓 NON VIP", callback_data=f"{prefix}_non_vip_only")],
+        [InlineKeyboardButton("👥 TOUS", callback_data=f"{prefix}_all_subscribers")],
+        [styled_button("❌ Annuler", style="danger", callback_data=cancel_callback)],
+    ])
+
+
 def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
-    """Choix de la cible pour une publication libre (DIFFUSION) : canaux/groupes, TOUS ou ABONNÉS."""
     keyboard = [
         [InlineKeyboardButton(f"📡 {target}", callback_data=f"diffchoice_target_{i}")]
         for i, target in enumerate(BROADCAST_TARGETS)
@@ -1014,7 +1018,6 @@ def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_poll_target_keyboard() -> InlineKeyboardMarkup:
-    """Choix de la cible pour l'envoi d'un sondage."""
     keyboard = [
         [InlineKeyboardButton(f"📡 {target}", callback_data=f"polltarget_idx_{i}")]
         for i, target in enumerate(BROADCAST_TARGETS)
@@ -1027,7 +1030,6 @@ def get_poll_target_keyboard() -> InlineKeyboardMarkup:
 
 
 def parse_poll_spec(text: str):
-    """Parse 'Question | Option1 | Option2 | ...' -> (question, [options]) ou (None, None)."""
     parts = [p.strip() for p in text.split("|") if p.strip()]
     if len(parts) < 3:
         return None, None
@@ -1037,7 +1039,6 @@ def parse_poll_spec(text: str):
 
 
 def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
-    """Boutons de cible pour diffuser directement le rapport de statistiques, + graphique."""
     keyboard = [
         [InlineKeyboardButton(f"📡 {target}", callback_data=f"statdiff_target_{i}")]
         for i, target in enumerate(BROADCAST_TARGETS)
@@ -1050,13 +1051,11 @@ def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
 
 
 def filter_entries_by_period(entries: list, days: int) -> list:
-    """Filtre les entrées des `days` derniers jours (basé sur l'heure d'entrée du trade)."""
     cutoff = datetime.now(TZ) - timedelta(days=days)
     return [e for e in entries if e.get('entre') and e['entre'] >= cutoff]
 
 
 def get_diffusion_buttons_prompt_keyboard() -> InlineKeyboardMarkup:
-    """Affiché sous l'invite de saisie des boutons-liens."""
     keyboard = [
         [InlineKeyboardButton("🚫 Aucun bouton", callback_data="diffbtn_none")],
         [InlineKeyboardButton("↩️ Annuler", callback_data="diffbtn_back")],
@@ -1065,9 +1064,10 @@ def get_diffusion_buttons_prompt_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_diffusion_extras_keyboard() -> InlineKeyboardMarkup:
-    """Affiché après le texte : proposer une photo (via canal de stockage), des boutons, ou terminer."""
     keyboard = [
         [InlineKeyboardButton("➕ Ajouter photo", callback_data="diffextra_photo")],
+        [InlineKeyboardButton("🎥 Ajouter une vidéo", callback_data="diffextra_video")],
+        [InlineKeyboardButton("⭕ Ajouter une note vidéo (cercle)", callback_data="diffextra_videonote")],
         [InlineKeyboardButton("🔗 Ajouter des boutons-liens", callback_data="diffextra_buttons")],
         [styled_button("✅ Terminer et voir l'aperçu", style="success", callback_data="diffextra_done")],
         [styled_button("↩️ Annuler", style="danger", callback_data="diffextra_back")],
@@ -1076,15 +1076,18 @@ def get_diffusion_extras_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_diffusion_photo_prompt_keyboard() -> InlineKeyboardMarkup:
-    """Affiché en attente de la photo à archiver dans le canal de stockage."""
-    keyboard = [
-        [InlineKeyboardButton("↩️ Annuler", callback_data="diffextra_cancel_photo")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Annuler", callback_data="diffextra_cancel_photo")]])
+
+
+def get_diffusion_video_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Annuler", callback_data="diffextra_cancel_video")]])
+
+
+def get_diffusion_videonote_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Annuler", callback_data="diffextra_cancel_videonote")]])
 
 
 def get_diffusion_preview_keyboard() -> InlineKeyboardMarkup:
-    """Affiché sous l'aperçu du post, avant confirmation de la diffusion."""
     keyboard = [
         [styled_button("📤 Diffuser maintenant", style="success", callback_data="diffbtn_finish")],
         [InlineKeyboardButton("🕒 Programmer", callback_data="diffbtn_schedule")],
@@ -1103,7 +1106,6 @@ DEFAULT_DIFFUSION_OPTIONS = {
 
 
 def get_diffusion_options_keyboard(options: dict) -> InlineKeyboardMarkup:
-    """Menu d'options façon Controller Bot : formatage, diffusion silencieuse, aperçu, réactions."""
     fmt = options.get("format", "HTML")
     silent = options.get("silent", False)
     link_preview = options.get("link_preview", True)
@@ -1129,11 +1131,9 @@ def get_diffusion_options_keyboard(options: dict) -> InlineKeyboardMarkup:
 
 
 def get_diffusion_result_keyboard() -> InlineKeyboardMarkup:
-    """Affiché après une diffusion réussie : permet de supprimer les messages envoyés partout."""
-    keyboard = [
+    return InlineKeyboardMarkup([
         [styled_button("🗑️ Supprimer le message diffusé", style="danger", callback_data="diffdelete_confirm")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 
 DIFFUSION_BUTTONS_PROMPT = (
@@ -1157,7 +1157,6 @@ DIFFUSION_BUTTONS_PROMPT = (
 
 
 async def delete_message_safe(bot, chat_id, message_id) -> bool:
-    """Tente de supprimer un message (chat privé, groupe ou canal). N'échoue jamais bruyamment."""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
@@ -1167,25 +1166,15 @@ async def delete_message_safe(bot, chat_id, message_id) -> bool:
 
 
 async def send_transient(context: ContextTypes.DEFAULT_TYPE, chat_id, text, reply_markup=None, parse_mode=None):
-    """
-    Envoie un message de navigation/confirmation "de passage" (menus, invites, accusés de
-    diffusion ou d'annulation). Contrairement aux signaux, résultats et bilans, ces messages
-    ne sont pas destinés à rester dans le chat : ils sont automatiquement supprimés dès que
-    l'utilisateur appuie sur un bouton suivant (voir clear_last_transient).
-    """
     sent = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=parse_mode,
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
+        chat_id=chat_id, text=text, parse_mode=parse_mode,
+        reply_markup=reply_markup, disable_web_page_preview=True,
     )
     context.user_data['last_transient_message'] = (chat_id, sent.message_id)
     return sent
 
 
 async def clear_last_transient(context: ContextTypes.DEFAULT_TYPE):
-    """Supprime le dernier message 'de passage' encore affiché, avant de traiter une nouvelle action."""
     transient = context.user_data.pop('last_transient_message', None)
     if transient:
         t_chat, t_id = transient
@@ -1193,38 +1182,77 @@ async def clear_last_transient(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_photo_safe(bot, chat_id, image_path, caption, reply_markup, parse_mode=None):
-    """
-    Tente d'envoyer une photo. Si Telegram refuse l'image (fichier corrompu,
-    format non supporté comme certains .heic, IMAGE_PROCESS_FAILED, etc.),
-    retombe automatiquement sur un message texte au lieu de faire planter le bot.
-    """
+    if image_path:
+        try:
+            if os.path.getsize(image_path) > 10 * 1024 * 1024:
+                logger.warning(f"Image trop grosse : {image_path}")
+                image_path = None
+        except Exception:
+            pass
+
     if image_path:
         try:
             with open(image_path, 'rb') as photo:
                 return await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=caption,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup
+                    chat_id=chat_id, photo=photo, caption=caption,
+                    parse_mode=parse_mode, reply_markup=reply_markup
                 )
         except Exception as e:
             logger.warning(f"Échec d'envoi de l'image '{image_path}' : {e}. Envoi du texte à la place.")
 
     return await bot.send_message(
-        chat_id=chat_id,
-        text=caption,
-        parse_mode=parse_mode,
-        disable_web_page_preview=True,
-        reply_markup=reply_markup
+        chat_id=chat_id, text=caption, parse_mode=parse_mode,
+        disable_web_page_preview=True, reply_markup=reply_markup
     )
+
+
+# --- HELPERS POUR LES CIBLES D'ABONNÉS (VIP / NON VIP / TOUS) ---
+
+async def get_subscriber_targets(context: ContextTypes.DEFAULT_TYPE, mode: str):
+    """Retourne les destinations selon le mode : 'all', 'vip_only', 'non_vip_only'."""
+    known = context.bot_data.get('known_users', set())
+
+    if mode == 'all':
+        destinations = []
+        seen_chat_ids = set()
+        for key in known:
+            d_chat_id, d_topic_id = parse_visitor_key(key)
+            if d_chat_id == ADMIN_CHAT_ID:
+                continue
+            if d_chat_id in seen_chat_ids:
+                continue
+            seen_chat_ids.add(d_chat_id)
+            destinations.append((d_chat_id, d_topic_id))
+        return destinations
+
+    if VIP_CHANNEL_CHAT_ID is None:
+        logger.warning(f"Cible '{mode}' demandée mais VIP_CHANNEL_CHAT_ID non configuré : traité comme 'all'.")
+        return await get_subscriber_targets(context, 'all')
+
+    destinations = []
+    seen_chat_ids = set()
+    for key in known:
+        d_chat_id, d_topic_id = parse_visitor_key(key)
+        if d_chat_id == ADMIN_CHAT_ID:
+            continue
+        if d_chat_id in seen_chat_ids:
+            continue
+        is_vip = await is_channel_member(context, d_chat_id, channel=VIP_CHANNEL_CHAT_ID)
+
+        if mode == 'vip_only' and not is_vip:
+            continue
+        if mode == 'non_vip_only' and is_vip:
+            continue
+
+        seen_chat_ids.add(d_chat_id)
+        destinations.append((d_chat_id, d_topic_id))
+
+    return destinations
 
 
 # --- HANDLERS ---
 
 async def show_main_menu(chat_id, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le menu principal (choix entre session gratuite et session VIP).
-    Ne réinitialise aucune donnée : sert uniquement de navigation."""
     await send_transient(
         context, chat_id,
         text="👇 Choisissez une option :",
@@ -1233,7 +1261,6 @@ async def show_main_menu(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def prompt_signal_start(chat_id, context: ContextTypes.DEFAULT_TYPE, prefix: str = ""):
-    """Affiche l'invite 'cliquez pour obtenir un signal', adaptée au mode actif (gratuit ou VIP)."""
     mode = context.user_data.get('mode', 'free')
     if mode == 'vip':
         session_key = context.user_data.get('vip_current')
@@ -1247,7 +1274,6 @@ async def prompt_signal_start(chat_id, context: ContextTypes.DEFAULT_TYPE, prefi
 
 
 async def start_free_session(chat_id, context: ContextTypes.DEFAULT_TYPE):
-    """Réinitialise la session gratuite (historique du bilan) et démarre le choix de diffusion."""
     context.user_data['mode'] = 'free'
     context.user_data['history'] = []
     context.user_data['last_signal'] = None
@@ -1266,8 +1292,6 @@ async def start_free_session(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session_key: str, reset: bool = False):
-    """Bascule le contexte utilisateur sur une sous-session VIP donnée, puis démarre le choix de diffusion.
-    Si reset=True, vide l'historique de cette sous-session uniquement."""
     context.user_data['mode'] = 'vip'
     context.user_data['vip_current'] = session_key
     context.user_data.setdefault('vip_history', empty_vip_history())
@@ -1290,17 +1314,15 @@ async def enter_vip_session(chat_id, context: ContextTypes.DEFAULT_TYPE, session
 
 
 async def is_channel_member(context: ContextTypes.DEFAULT_TYPE, user_id: int, channel=None) -> bool:
-    """Vérifie si l'utilisateur est abonné au canal donné (par défaut CHANNEL_CHAT_ID).
-    Ne bloque jamais en cas d'erreur : traite comme membre si indéterminable."""
     target_channel = channel if channel is not None else CHANNEL_CHAT_ID
     if target_channel is None:
-        return True  # Aucun canal configuré : on ne rappelle/filtre rien
+        return True
     try:
         member = await context.bot.get_chat_member(chat_id=target_channel, user_id=user_id)
         return member.status in ("creator", "administrator", "member", "restricted")
     except Exception as e:
         logger.warning(f"Impossible de vérifier l'abonnement à {target_channel} pour {user_id} : {e}")
-        return True  # En cas d'erreur (bot pas admin du canal, etc.), on ne pénalise pas le visiteur
+        return True
 
 
 LANG_CHOICE_KEYBOARD = InlineKeyboardMarkup([
@@ -1312,7 +1334,6 @@ LANG_CHOICE_KEYBOARD = InlineKeyboardMarkup([
 
 
 async def send_channel_reminder(chat_id, context: ContextTypes.DEFAULT_TYPE, lang: str = "fr"):
-    """Invite le visiteur à rejoindre le canal, avec un bouton cliquable (bilingue)."""
     if not CHANNEL_INVITE_LINK:
         return
     button_label = "📢 Rejoindre le canal" if lang == "fr" else "📢 Join the channel"
@@ -1325,7 +1346,6 @@ async def send_channel_reminder(chat_id, context: ContextTypes.DEFAULT_TYPE, lan
 
 
 async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, first_name: str = "", lang: str = "fr"):
-    """Envoie les deux messages d'accueil à un visiteur (non-administrateur) qui démarre le bot."""
     safe_name = html.escape(first_name) if first_name else ""
     name_part = f" {safe_name}" if safe_name else ""
 
@@ -1373,7 +1393,6 @@ async def send_welcome_messages(chat_id, context: ContextTypes.DEFAULT_TYPE, fir
 
 
 def get_tier_choice_keyboard() -> InlineKeyboardMarkup:
-    """Choix ponctuel du statut Telegram (Premium ou Standard), pour activer les emojis animés."""
     keyboard = [
         [
             InlineKeyboardButton("💎 TELEGRAM PREMIUM", callback_data="settier_premium"),
@@ -1384,16 +1403,14 @@ def get_tier_choice_keyboard() -> InlineKeyboardMarkup:
 
 
 def is_blocked(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
-    """Vérifie si ce chat_id est sur liste noire (/block)."""
     return chat_id in context.bot_data.get('blocked_users', set())
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /start : accueil personnalisé pour les visiteurs, menu principal pour l'administrateur."""
     chat_id = update.effective_chat.id
 
     if is_blocked(context, chat_id):
-        return  # Utilisateur bloqué (/block) : on l'ignore silencieusement
+        return
 
     visitor_key = make_visitor_key(chat_id, None)
     known_users_set = context.bot_data.get('known_users', set())
@@ -1433,11 +1450,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_channel_reminder(chat_id, context, lang=lang)
         return
 
-    # Réinitialise tout état de composition en cours (diffusion, capture) pour repartir propre
     context.user_data['diffusion_draft'] = None
     context.user_data['awaiting_capture'] = False
 
-    # À chaque /start, redemande PREMIUM ou STANDARD avant d'afficher le menu principal
     logger.info(f"Système détecté pour l'admin {chat_id} : {SYSTEM_OS}")
     await send_transient(
         context, chat_id,
@@ -1447,7 +1462,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /help : liste les fonctionnalités disponibles."""
     chat_id = update.effective_chat.id
     if not is_authorized(chat_id):
         await update.message.reply_text("⛔ Accès non autorisé.")
@@ -1457,22 +1471,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "<b>ℹ️ AIDE</b>\n\n"
         "/start — Menu principal (session gratuite / VIP)\n"
-        "/stats — Statistiques détaillées (taux de réussite, meilleur/pire actif)\n"
-        "/broadcast <message> — (admin) Envoie un message à tous les utilisateurs connus\n"
-        "/historique <chat_id> — (admin) Affiche l'échange enregistré avec ce visiteur\n"
+        "/stats — Statistiques détaillées\n"
+        "/broadcast &lt;message&gt; — (admin) Envoie à tous les utilisateurs connus\n"
+        "/historique &lt;chat_id&gt; — (admin) Affiche l'échange avec ce visiteur\n"
         "/help — Affiche ce message\n\n"
         "🆓 <b>SESSION GRATUITE</b> — signaux + bilan classique\n"
-        "👑 <b>SESSION VIP</b> — 4 sous-sessions (matin/midi/soir/nuit), accessibles librement, "
-        "chacune avec son propre historique et son propre bilan\n"
-        "📊 <b>RAPPORT COMPLET VIP</b> — récapitulatif regroupant les 4 sous-sessions\n"
-        "↩️ <b>ANNULER DERNIER</b> — annule le dernier résultat enregistré par erreur\n"
-        "🔄 <b>RECOMMENCER CETTE SESSION</b> — vide l'historique d'une seule sous-session VIP"
+        "👑 <b>SESSION VIP</b> — 4 sous-sessions (matin/midi/soir/nuit)\n"
+        "📊 <b>RAPPORT COMPLET VIP</b> — récapitulatif des 4 sous-sessions\n"
+        "↩️ <b>ANNULER DERNIER</b> — annule le dernier résultat\n"
+        "🔄 <b>RECOMMENCER CETTE SESSION</b> — vide une sous-session VIP\n\n"
+        "📢 <b>DIFFUSION</b> supporte : texte, photo, vidéo, note vidéo (cercle)\n"
+        "👥 <b>ABONNÉS</b> propose : VIP / NON VIP / TOUS"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /stats : statistiques détaillées, session gratuite + VIP (par sous-session et total)."""
     chat_id = update.effective_chat.id
     if not is_authorized(chat_id):
         await update.message.reply_text("⛔ Accès non autorisé.")
@@ -1499,10 +1513,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job planifié : réinitialise l'historique gratuit et VIP de tous les utilisateurs connus."""
     all_user_data = context.application.user_data
     count = 0
-    for data in all_user_data.values():
+    for i, data in enumerate(all_user_data.values()):
         data['history'] = []
         data['vip_history'] = empty_vip_history()
         data['last_signal'] = None
@@ -1510,11 +1523,12 @@ async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
         data['current_trade'] = None
         data['last_broadcast'] = None
         count += 1
+        if i % 100 == 0:
+            await asyncio.sleep(0)
     logger.info(f"Réinitialisation quotidienne effectuée pour {count} utilisateur(s).")
 
 
 async def backup_persistence_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job planifié : copie quotidienne du fichier de persistance dans backups/."""
     try:
         os.makedirs("backups", exist_ok=True)
         if os.path.exists(PERSISTENCE_FILE):
@@ -1528,22 +1542,38 @@ async def backup_persistence_job(context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Échec de la sauvegarde automatique : {e}")
 
 
+async def cleanup_inactive_job(context: ContextTypes.DEFAULT_TYPE):
+    cutoff = datetime.now(TZ) - timedelta(days=90)
+    first_seen = context.bot_data.get('visitor_first_seen', {})
+    known = context.bot_data.get('known_users', set())
+    conv_log = context.bot_data.get('conversation_log', {})
+
+    to_remove = [k for k, v in first_seen.items() if v < cutoff]
+    for k in to_remove:
+        known.discard(k)
+        first_seen.pop(k, None)
+        conv_log.pop(k, None)
+
+    if to_remove:
+        logger.info(f"Purge : {len(to_remove)} visiteur(s) inactif(s) supprimé(s).")
+
+
 async def scheduled_diffusion_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job planifié (ponctuel) : envoie une publication programmée à l'heure prévue."""
     job_data = context.job.data
     draft = job_data['draft']
     admin_chat_id = job_data['admin_chat_id']
 
     if draft['target'] == 'all':
         destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
-    elif draft['target'] == 'subscribers':
-        known = context.bot_data.get('known_users', set())
-        destinations = []
-        for key in known:
-            d_chat_id, d_topic_id = parse_visitor_key(key)
-            if d_chat_id == ADMIN_CHAT_ID:
-                continue
-            destinations.append((d_chat_id, d_topic_id))
+    elif draft['target'] in ('subscribers', 'subscribers_vip', 'subscribers_non_vip', 'subscribers_all'):
+        if draft['target'] == 'subscribers_all':
+            destinations = await get_subscriber_targets(context, 'all')
+        elif draft['target'] == 'subscribers_vip':
+            destinations = await get_subscriber_targets(context, 'vip_only')
+        elif draft['target'] == 'subscribers_non_vip':
+            destinations = await get_subscriber_targets(context, 'non_vip_only')
+        else:
+            destinations = await get_subscriber_targets(context, 'all')
     else:
         destinations = [(normalize_broadcast_target(draft['target']), None)]
 
@@ -1566,7 +1596,6 @@ async def scheduled_diffusion_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def channel_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job planifié : rappelle de rejoindre le canal aux visiteurs inactifs depuis CHANNEL_REMINDER_DAYS."""
     if CHANNEL_CHAT_ID is None:
         return
 
@@ -1595,8 +1624,7 @@ async def channel_reminder_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=d_chat_id,
                 text="📢 Tu n'as toujours pas rejoint mon canal officiel — ne rate pas les prochains signaux !",
-                reply_markup=keyboard,
-                **extra,
+                reply_markup=keyboard, **extra,
             )
             reminded.add(key)
             sent += 1
@@ -1616,11 +1644,6 @@ ANALYSIS_ANIMATION_FRAMES = [
 
 
 async def show_analysis_animation(context: ContextTypes.DEFAULT_TYPE, chat_id):
-    """
-    Affiche une petite animation "⏳ Analyse de signal..." pendant ~5 secondes
-    (un point qui s'ajoute à chaque seconde), puis supprime le message avant
-    que le vrai signal ne soit envoyé.
-    """
     try:
         msg = await context.bot.send_message(chat_id=chat_id, text=ANALYSIS_ANIMATION_FRAMES[0])
     except Exception as e:
@@ -1632,21 +1655,19 @@ async def show_analysis_animation(context: ContextTypes.DEFAULT_TYPE, chat_id):
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=frame)
         except Exception:
-            pass  # une édition ratée (rate-limit, etc.) n'interrompt pas l'animation
+            pass
 
     await asyncio.sleep(1)
     await delete_message_safe(context.bot, chat_id, msg.message_id)
 
 
 async def send_signal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envoie un signal avec une image ALEATOIRE du dossier IMG/."""
     chat_id = update.effective_chat.id
     await show_analysis_animation(context, chat_id)
 
     signal = generate_signal_data()
     message_text = format_signal_text(signal)
 
-    # Sauvegarde du signal complet (utile pour le bilan) et de la clé de l'actif
     asset_key = get_asset_filename(signal['actif'])
     context.user_data['last_asset'] = asset_key
     context.user_data['last_signal'] = signal
@@ -1654,19 +1675,13 @@ async def send_signal_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     image_path = get_random_jpeg(DIR_IMG)
 
     sent_message = await send_photo_safe(
-        bot=context.bot,
-        chat_id=chat_id,
-        image_path=image_path,
-        caption=message_text,
-        reply_markup=get_result_keyboard(),
-        parse_mode="HTML"
+        bot=context.bot, chat_id=chat_id, image_path=image_path,
+        caption=message_text, reply_markup=get_result_keyboard(), parse_mode="HTML"
     )
 
-    # Mémorise le message envoyé pour pouvoir le supprimer si NEW est cliqué
     if sent_message:
         context.user_data['last_signal_message'] = (chat_id, sent_message.message_id)
 
-        # Nouveau "trade" en cours : réinitialise le suivi pour ANNULER DERNIER
         context.user_data['current_trade'] = {
             'signal_message': (chat_id, sent_message.message_id),
             'result_message': None,
@@ -1683,28 +1698,22 @@ async def send_signal_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def send_bilan_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envoie le bilan de la session gratuite en cours."""
     history = context.user_data.get('history', [])
     text = format_bilan_text(history)
     chat_id = update.effective_chat.id
 
     await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
-        reply_markup=get_bilan_keyboard()
+        chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=get_bilan_keyboard()
     )
     remember_broadcast(context, kind='text', text=text, parse_mode="HTML")
     await auto_broadcast_last(context)
 
 
 async def send_vip_bilan_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envoie le bilan de la sous-session VIP en cours."""
     chat_id = update.effective_chat.id
     session_key = context.user_data.get('vip_current')
 
     if session_key not in VIP_SESSION_LABELS:
-        # Sécurité : si jamais on arrive ici sans sous-session active
         await show_main_menu(chat_id, context)
         return
 
@@ -1719,9 +1728,7 @@ async def send_vip_bilan_action(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
+        chat_id=chat_id, text=text, parse_mode="HTML",
         reply_markup=get_vip_bilan_keyboard(session_key)
     )
     remember_broadcast(context, kind='text', text=text, parse_mode="HTML")
@@ -1729,15 +1736,12 @@ async def send_vip_bilan_action(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def send_vip_rapport_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envoie le rapport complet VIP (les 4 sous-sessions regroupées)."""
     chat_id = update.effective_chat.id
     vip_history = context.user_data.setdefault('vip_history', empty_vip_history())
     text = format_full_vip_report(vip_history)
 
     await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
+        chat_id=chat_id, text=text, parse_mode="HTML",
         reply_markup=get_vip_rapport_keyboard()
     )
     remember_broadcast(context, kind='text', text=text, parse_mode="HTML")
@@ -1745,8 +1749,6 @@ async def send_vip_rapport_action(update: Update, context: ContextTypes.DEFAULT_
 
 
 def record_result(context: ContextTypes.DEFAULT_TYPE, result_key: str):
-    """Enregistre le résultat du signal courant dans l'historique approprié
-    (session gratuite ou sous-session VIP active)."""
     last_signal = context.user_data.get('last_signal')
     if last_signal is None:
         return
@@ -1761,12 +1763,10 @@ def record_result(context: ContextTypes.DEFAULT_TYPE, result_key: str):
         history = context.user_data.setdefault('history', [])
         history.append({**last_signal, 'result': result_key})
 
-    # Évite un double enregistrement si l'utilisateur clique deux fois
     context.user_data['last_signal'] = None
 
 
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère le clic sur les boutons."""
     query = update.callback_query
     await query.answer()
 
@@ -1774,11 +1774,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
 
     if is_blocked(context, chat_id):
-        return  # Utilisateur bloqué (/block) : on l'ignore silencieusement
+        return
 
     remember_known_user(context, make_visitor_key(chat_id, None))
 
-    # Le choix de langue doit rester accessible même aux visiteurs non autorisés
     if data == "setlang_fr" or data == "setlang_en":
         lang = 'fr' if data == "setlang_fr" else 'en'
         context.user_data['lang'] = lang
@@ -1794,11 +1793,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_message(chat_id=chat_id, text="⛔ Accès non autorisé.")
         return
 
-    # Nettoyage : le précédent message "de passage" (menu/confirmation) disparaît dès qu'on
-    # passe à l'action suivante. Seuls signaux, résultats et bilans restent dans le chat.
     await clear_last_transient(context)
 
-    # --- Navigation générale ---
+    # --- Navigation ---
 
     if data == "confirm_resetall":
         context.user_data['history'] = []
@@ -1818,10 +1815,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data['telegram_tier'] = 'standard'
             await send_transient(
                 context, chat_id,
-                text=(
-                    "Telegram indique que ce compte n'a pas Premium actif : "
-                    "basculé sur STANDARD."
-                ),
+                text="Telegram indique que ce compte n'a pas Premium actif : basculé sur STANDARD.",
                 reply_markup=ADMIN_QUICK_KEYBOARD,
             )
         else:
@@ -1856,7 +1850,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_vip_rapport_action(update, context)
         return
 
-    # --- Choix de la cible de diffusion automatique pour la session (signal + résultat) ---
+    # --- Choix cible diffusion auto ---
 
     if data == "setbcast_none" or data == "setbcast_all" or data.startswith("setbcast_target_"):
         if data == "setbcast_none":
@@ -1913,35 +1907,26 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         promo_text = "🔥 Regarde les résultats de notre session VIP aujourd'hui :\n\n" + bilan_text
 
-        known = context.bot_data.get('known_users', set())
-        sent, skipped, failed = 0, 0, 0
-        for uid in known:
-            uid_chat_id, _ = parse_visitor_key(uid)
-            if uid_chat_id == ADMIN_CHAT_ID:
-                continue
-            if await is_channel_member(context, uid_chat_id, channel=VIP_CHANNEL_CHAT_ID):
-                skipped += 1
-                continue
+        destinations = await get_subscriber_targets(context, 'non_vip_only')
+        sent, failed = 0, 0
+        for dest_chat, dest_topic in destinations:
             try:
-                await send_to_visitor(context, uid, promo_text)
+                key = str(dest_chat) if dest_topic is None else f"{dest_chat}:{dest_topic}"
+                await send_to_visitor(context, key, promo_text)
                 sent += 1
             except Exception as e:
-                logger.warning(f"Échec d'envoi ABONNÉS NON VIP à {uid} : {e}")
+                logger.warning(f"Échec d'envoi ABONNÉS NON VIP à {dest_chat} : {e}")
                 failed += 1
 
         await send_transient(
             context, chat_id,
-            text=f"👥 Envoyé à {sent} abonné(s) non-VIP ({skipped} déjà VIP, {failed} échec(s)).",
+            text=f"👥 Envoyé à {sent} abonné(s) non-VIP ({failed} échec(s)).",
         )
         return
-
-    # --- Session gratuite : NEW SESSION (équivaut à redémarrer la session gratuite) ---
 
     if data == "btn_new_session":
         await start_free_session(chat_id, context)
         return
-
-    # --- Commun gratuit / VIP : SIGNAL, BILAN, NEW, résultats ---
 
     if data == "btn_get_signal":
         await send_signal_action(update, context)
@@ -1964,7 +1949,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.warning(f"Impossible de supprimer le message (NEW) : {e}")
 
-        # Le signal remplacé n'est pas conservé dans l'historique
         context.user_data['last_signal'] = None
         await send_signal_action(update, context)
         return
@@ -1977,10 +1961,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_transient(context, chat_id, text="Aucune donnée pour générer un graphique.")
             return
         buf = generate_performance_chart(all_entries)
+        if buf is None:
+            await send_transient(context, chat_id, text="⚠️ Graphique indisponible (matplotlib manquant).")
+            return
         await context.bot.send_photo(chat_id=chat_id, photo=buf, caption="📈 Performance par jour")
         return
 
-    if data == "statdiff_all" or data == "statdiff_subscribers" or data.startswith("statdiff_target_"):
+    # --- Diffusion stats ---
+
+    if data.startswith("statdiff_"):
         content = context.user_data.get('last_broadcast')
         if not content:
             await send_transient(context, chat_id, text="Rien à diffuser.")
@@ -1989,13 +1978,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data == "statdiff_all":
             destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
         elif data == "statdiff_subscribers":
-            known = context.bot_data.get('known_users', set())
-            destinations = []
-            for key in known:
-                d_chat_id, d_topic_id = parse_visitor_key(key)
-                if d_chat_id == ADMIN_CHAT_ID:
-                    continue
-                destinations.append((d_chat_id, d_topic_id))
+            destinations = await get_subscriber_targets(context, 'all')
         else:
             idx = int(data.replace("statdiff_target_", ""))
             if idx < 0 or idx >= len(BROADCAST_TARGETS):
@@ -2022,12 +2005,52 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    # --- Sondage ---
+
     if data == "polltarget_cancel":
         context.user_data['poll_draft'] = None
         await send_transient(context, chat_id, text="Sondage annulé.")
         return
 
-    if data == "polltarget_all" or data == "polltarget_subscribers" or data.startswith("polltarget_idx_"):
+    if data == "polltarget_subscribers":
+        await send_transient(
+            context, chat_id,
+            text="👥 À quels abonnés envoyer le sondage ?",
+            reply_markup=get_subscribers_submenu_keyboard("pollsub", "polltarget_cancel"),
+        )
+        return
+
+    if data in ("pollsub_all_subscribers", "pollsub_vip_only", "pollsub_non_vip_only"):
+        poll_draft = context.user_data.get('poll_draft')
+        if not poll_draft or not poll_draft.get('question'):
+            await send_transient(context, chat_id, text="Rien à envoyer.")
+            return
+
+        if data == "pollsub_all_subscribers":
+            destinations = await get_subscriber_targets(context, 'all')
+        elif data == "pollsub_vip_only":
+            destinations = await get_subscriber_targets(context, 'vip_only')
+        else:
+            destinations = await get_subscriber_targets(context, 'non_vip_only')
+
+        sent, failed = 0, 0
+        for dest, dm_topic_id in destinations:
+            try:
+                extra = {'direct_messages_topic_id': dm_topic_id} if dm_topic_id is not None else {}
+                await context.bot.send_poll(
+                    chat_id=dest, question=poll_draft['question'],
+                    options=poll_draft['options'], **extra,
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Échec d'envoi du sondage vers {dest} : {e}")
+                failed += 1
+
+        context.user_data['poll_draft'] = None
+        await send_transient(context, chat_id, text=f"📊 Sondage envoyé : {sent} réussi(s), {failed} échec(s).")
+        return
+
+    if data == "polltarget_all" or data.startswith("polltarget_idx_"):
         poll_draft = context.user_data.get('poll_draft')
         if not poll_draft or not poll_draft.get('question'):
             await send_transient(context, chat_id, text="Rien à envoyer.")
@@ -2035,14 +2058,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if data == "polltarget_all":
             destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
-        elif data == "polltarget_subscribers":
-            known = context.bot_data.get('known_users', set())
-            destinations = []
-            for key in known:
-                d_chat_id, d_topic_id = parse_visitor_key(key)
-                if d_chat_id == ADMIN_CHAT_ID:
-                    continue
-                destinations.append((d_chat_id, d_topic_id))
         else:
             idx = int(data.replace("polltarget_idx_", ""))
             if idx < 0 or idx >= len(BROADCAST_TARGETS):
@@ -2053,9 +2068,10 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         sent, failed = 0, 0
         for dest, dm_topic_id in destinations:
             try:
-                extra = {'message_thread_id': dm_topic_id} if dm_topic_id is not None else {}
+                extra = {'direct_messages_topic_id': dm_topic_id} if dm_topic_id is not None else {}
                 await context.bot.send_poll(
-                    chat_id=dest, question=poll_draft['question'], options=poll_draft['options'], **extra,
+                    chat_id=dest, question=poll_draft['question'],
+                    options=poll_draft['options'], **extra,
                 )
                 sent += 1
             except Exception as e:
@@ -2065,6 +2081,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['poll_draft'] = None
         await send_transient(context, chat_id, text=f"📊 Sondage envoyé : {sent} réussi(s), {failed} échec(s).")
         return
+
+    # --- Diffusion libre ---
 
     if data == "btn_diffusion_menu":
         await send_transient(
@@ -2080,11 +2098,42 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(chat_id, context)
         return
 
-    if data == "diffchoice_all" or data == "diffchoice_subscribers" or data.startswith("diffchoice_target_"):
+    if data == "diffchoice_subscribers":
+        await send_transient(
+            context, chat_id,
+            text="👥 À quels abonnés envoyer ?",
+            reply_markup=get_subscribers_submenu_keyboard("diffsub", "diffchoice_cancel"),
+        )
+        return
+
+    if data in ("diffsub_all_subscribers", "diffsub_vip_only", "diffsub_non_vip_only"):
+        if data == "diffsub_all_subscribers":
+            target_value = "subscribers_all"
+        elif data == "diffsub_vip_only":
+            target_value = "subscribers_vip"
+        else:
+            target_value = "subscribers_non_vip"
+
+        context.user_data['diffusion_draft'] = {
+            'target': target_value,
+            'step': 'content',
+            'text': None,
+            'photo_file_id': None,
+            'video_file_id': None,
+            'video_note_file_id': None,
+            'image_url': None,
+            'buttons': [],
+            'options': dict(DEFAULT_DIFFUSION_OPTIONS),
+        }
+        await send_transient(
+            context, chat_id,
+            text="✍️ Envoie le texte et/ou la photo/vidéo de ta publication :",
+        )
+        return
+
+    if data == "diffchoice_all" or data.startswith("diffchoice_target_"):
         if data == "diffchoice_all":
             target_value = "all"
-        elif data == "diffchoice_subscribers":
-            target_value = "subscribers"
         else:
             idx = int(data.replace("diffchoice_target_", ""))
             if idx < 0 or idx >= len(BROADCAST_TARGETS):
@@ -2097,15 +2146,19 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             'step': 'content',
             'text': None,
             'photo_file_id': None,
+            'video_file_id': None,
+            'video_note_file_id': None,
             'image_url': None,
             'buttons': [],
             'options': dict(DEFAULT_DIFFUSION_OPTIONS),
         }
         await send_transient(
             context, chat_id,
-            text="✍️ Envoie le texte et/ou la photo de ta publication :",
+            text="✍️ Envoie le texte et/ou la photo/vidéo de ta publication :",
         )
         return
+
+    # --- Extras de diffusion ---
 
     if data == "diffextra_photo":
         draft = context.user_data.get('diffusion_draft')
@@ -2120,7 +2173,63 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    if data == "diffextra_video":
+        draft = context.user_data.get('diffusion_draft')
+        if not draft:
+            await send_transient(context, chat_id, text="Rien à diffuser.")
+            return
+        draft['step'] = 'awaiting_video'
+        await send_transient(
+            context, chat_id,
+            text="🎥 Envoie la vidéo à publier :",
+            reply_markup=get_diffusion_video_prompt_keyboard(),
+        )
+        return
+
+    if data == "diffextra_videonote":
+        draft = context.user_data.get('diffusion_draft')
+        if not draft:
+            await send_transient(context, chat_id, text="Rien à diffuser.")
+            return
+        draft['step'] = 'awaiting_videonote'
+        await send_transient(
+            context, chat_id,
+            text=(
+                "⭕ Envoie la vidéo à convertir en cercle (note vidéo).\n"
+                "Le bot va la convertir automatiquement via FFmpeg.\n\n"
+                "💡 Tu peux aussi envoyer directement une note vidéo déjà au format cercle."
+            ),
+            reply_markup=get_diffusion_videonote_prompt_keyboard(),
+        )
+        return
+
     if data == "diffextra_cancel_photo":
+        draft = context.user_data.get('diffusion_draft')
+        if not draft:
+            await show_main_menu(chat_id, context)
+            return
+        draft['step'] = 'extras'
+        await send_transient(
+            context, chat_id,
+            text="Que veux-tu ajouter ?",
+            reply_markup=get_diffusion_extras_keyboard(),
+        )
+        return
+
+    if data == "diffextra_cancel_video":
+        draft = context.user_data.get('diffusion_draft')
+        if not draft:
+            await show_main_menu(chat_id, context)
+            return
+        draft['step'] = 'extras'
+        await send_transient(
+            context, chat_id,
+            text="Que veux-tu ajouter ?",
+            reply_markup=get_diffusion_extras_keyboard(),
+        )
+        return
+
+    if data == "diffextra_cancel_videonote":
         draft = context.user_data.get('diffusion_draft')
         if not draft:
             await show_main_menu(chat_id, context)
@@ -2162,12 +2271,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         draft['text'] = None
         draft['photo_file_id'] = None
+        draft['video_file_id'] = None
+        draft['video_note_file_id'] = None
         draft['image_url'] = None
         draft['buttons'] = []
         draft['step'] = 'content'
         await send_transient(
             context, chat_id,
-            text="✍️ Envoie le texte et/ou la photo de ta publication :",
+            text="✍️ Envoie le texte et/ou la photo/vidéo de ta publication :",
         )
         return
 
@@ -2232,7 +2343,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data == "diffopt_back":
         draft = context.user_data.get('diffusion_draft')
-        if not draft or (not draft.get('text') and not draft.get('photo_file_id')):
+        if not draft or (not draft.get('text') and not draft.get('photo_file_id')
+                          and not draft.get('video_file_id') and not draft.get('video_note_file_id')):
             await show_main_menu(chat_id, context)
             return
         await show_diffusion_preview(context, chat_id, draft)
@@ -2240,7 +2352,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data == "diffbtn_schedule":
         draft = context.user_data.get('diffusion_draft')
-        if not draft or (not draft.get('text') and not draft.get('photo_file_id')):
+        if not draft or (not draft.get('text') and not draft.get('photo_file_id')
+                          and not draft.get('video_file_id') and not draft.get('video_note_file_id')):
             await send_transient(context, chat_id, text="Rien à programmer.")
             return
         draft['step'] = 'awaiting_schedule_time'
@@ -2256,7 +2369,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         draft = context.user_data.get('diffusion_draft')
-        if not draft or (not draft.get('text') and not draft.get('photo_file_id')):
+        if not draft or (not draft.get('text') and not draft.get('photo_file_id')
+                          and not draft.get('video_file_id') and not draft.get('video_note_file_id')):
             await send_transient(context, chat_id, text="Rien à diffuser.")
             return
 
@@ -2264,14 +2378,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             if draft['target'] == 'all':
                 destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
-            elif draft['target'] == 'subscribers':
-                known = context.bot_data.get('known_users', set())
-                destinations = []
-                for key in known:
-                    d_chat_id, d_topic_id = parse_visitor_key(key)
-                    if d_chat_id == ADMIN_CHAT_ID:
-                        continue
-                    destinations.append((d_chat_id, d_topic_id))
+            elif draft['target'] == 'subscribers_all':
+                destinations = await get_subscriber_targets(context, 'all')
+            elif draft['target'] == 'subscribers_vip':
+                destinations = await get_subscriber_targets(context, 'vip_only')
+            elif draft['target'] == 'subscribers_non_vip':
+                destinations = await get_subscriber_targets(context, 'non_vip_only')
             else:
                 destinations = [(normalize_broadcast_target(draft['target']), None)]
 
@@ -2312,10 +2424,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data == "btn_capture":
         context.user_data['awaiting_capture'] = True
-        await send_transient(
-            context, chat_id,
-            text="📸 Envoie ta capture d'écran :",
-        )
+        await send_transient(context, chat_id, text="📸 Envoie ta capture d'écran :")
         return
 
     if data == "btn_undo":
@@ -2339,7 +2448,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         removed = entries.pop()
 
-        # Supprime le signal, le résultat et toutes leurs copies diffusées (canaux/groupes)
         trade = context.user_data.get('current_trade') or {}
 
         if trade.get('signal_message'):
@@ -2353,7 +2461,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         for b_chat, b_id in trade.get('broadcasts', []):
             await delete_message_safe(context.bot, b_chat, b_id)
 
-        # Trade entièrement annulé : plus rien à annuler tant qu'un nouveau signal n'est pas généré
         context.user_data['current_trade'] = None
         context.user_data['last_broadcast'] = None
 
@@ -2363,7 +2470,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_transient(context, chat_id, text=text, reply_markup=reply_markup)
         return
 
-    # --- Diffusion vers canaux/groupes ---
+    # --- Diffusion manuelle ---
 
     if data == "btn_broadcast_menu":
         content = context.user_data.get('last_broadcast')
@@ -2390,21 +2497,25 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 if content['kind'] == 'photo' and content.get('photo_file_id'):
                     sent = await context.bot.send_photo(
-                        chat_id=dest,
-                        photo=content['photo_file_id'],
-                        caption=content.get('text'),
-                        parse_mode=content.get('parse_mode'),
+                        chat_id=dest, photo=content['photo_file_id'],
+                        caption=content.get('text'), parse_mode=content.get('parse_mode'),
+                    )
+                elif content['kind'] == 'video' and content.get('video_file_id'):
+                    sent = await context.bot.send_video(
+                        chat_id=dest, video=content['video_file_id'],
+                        caption=content.get('text'), parse_mode=content.get('parse_mode'),
+                    )
+                elif content['kind'] == 'video_note' and content.get('video_note_file_id'):
+                    sent = await context.bot.send_video_note(
+                        chat_id=dest, video_note=content['video_note_file_id'],
                     )
                 else:
                     sent = await context.bot.send_message(
-                        chat_id=dest,
-                        text=content.get('text') or '',
-                        parse_mode=content.get('parse_mode'),
-                        disable_web_page_preview=True,
+                        chat_id=dest, text=content.get('text') or '',
+                        parse_mode=content.get('parse_mode'), disable_web_page_preview=True,
                     )
                 results.append(f"✅ {target}")
 
-                # Mémorise cette copie pour pouvoir la supprimer via ANNULER DERNIER
                 trade = context.user_data.get('current_trade')
                 if trade is not None:
                     trade.setdefault('broadcasts', []).append((sent.chat_id, sent.message_id))
@@ -2418,7 +2529,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # Boutons de Victoires
+    # --- Résultats ---
+
     _win_emoji = emojify(context, "✅")
     win_map = {
         "res_mg0": (f"{_win_emoji}<b>GAIN DIRECT</b>{_win_emoji}", "mg0"),
@@ -2434,18 +2546,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         last_asset = context.user_data.get('last_asset', None)
 
-        # Cherche l'image de la paire dans IMG_WIN/ (insensible aux majuscules)
         image_path = get_specific_jpeg_only(DIR_WIN, last_asset)
 
         reply_markup = get_vip_result_keyboard() if mode == 'vip' else get_signal_keyboard()
 
         sent_message = await send_photo_safe(
-            bot=context.bot,
-            chat_id=chat_id,
-            image_path=image_path,
-            caption=caption_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML"
+            bot=context.bot, chat_id=chat_id, image_path=image_path,
+            caption=caption_text, reply_markup=reply_markup, parse_mode="HTML"
         )
 
         if sent_message:
@@ -2461,7 +2568,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await auto_broadcast_last(context)
         return
 
-    # Bouton Défaite (❌)
     if data == "res_lose":
         mode = context.user_data.get('mode', 'free')
         record_result(context, "lose")
@@ -2473,12 +2579,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup = get_vip_result_keyboard() if mode == 'vip' else get_signal_keyboard()
 
         sent_message = await send_photo_safe(
-            bot=context.bot,
-            chat_id=chat_id,
-            image_path=image_path,
-            caption=caption_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML"
+            bot=context.bot, chat_id=chat_id, image_path=image_path,
+            caption=caption_text, reply_markup=reply_markup, parse_mode="HTML"
         )
 
         if sent_message:
@@ -2495,11 +2597,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def send_to_visitor(context: ContextTypes.DEFAULT_TYPE, visitor_key: str, text: str, parse_mode: str = None):
-    """
-    Envoie un message à un visiteur à partir de sa clé (voir make_visitor_key). Ajoute
-    automatiquement le direct_messages_topic_id si ce visiteur a écrit via les "Messages
-    directs" d'un canal (Telegram exige ce paramètre pour pouvoir lui répondre).
-    """
     chat_id, dm_topic_id = parse_visitor_key(visitor_key)
     kwargs = {'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode}
     if dm_topic_id is not None:
@@ -2508,11 +2605,7 @@ async def send_to_visitor(context: ContextTypes.DEFAULT_TYPE, visitor_key: str, 
 
 
 async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Reçoit une photo envoyée par l'admin, dans l'un de ces deux contextes :
-    - CAPTURE (après un résultat) : diffuse vers la cible active de la session.
-    - DIFFUSION (composeur de post libre) : l'utilise comme image de la publication.
-    """
+    """Reçoit une photo (CAPTURE / DIFFUSION content / DIFFUSION storage_photo)."""
     message = update.message
     if message is None or not message.photo:
         return
@@ -2527,12 +2620,19 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         draft['photo_file_id'] = message.photo[-1].file_id
         if message.caption_html:
             draft['text'] = message.caption_html
-        draft['step'] = 'buttons'
-        await send_transient(
-            context, chat_id,
-            text=DIFFUSION_BUTTONS_PROMPT,
-            reply_markup=get_diffusion_buttons_prompt_keyboard(),
-        )
+            draft['step'] = 'extras'
+            await send_transient(
+                context, chat_id,
+                text="📸 Photo enregistrée. Que veux-tu ajouter ?",
+                reply_markup=get_diffusion_extras_keyboard(),
+            )
+        else:
+            context.user_data['awaiting_content_text_after_media'] = 'photo'
+            draft['step'] = 'awaiting_content_text'
+            await send_transient(
+                context, chat_id,
+                text="✍️ Envoie maintenant le texte (ou tape /skip pour ne rien mettre) :",
+            )
         return
 
     if draft and draft.get('step') == 'awaiting_storage_photo':
@@ -2557,7 +2657,7 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not context.user_data.get('awaiting_capture'):
-        return  # Pas une capture attendue : on n'interfère pas
+        return
 
     context.user_data['awaiting_capture'] = False
     file_id = message.photo[-1].file_id
@@ -2578,33 +2678,202 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Gère les vidéos classiques.
+    - Si on attend une note vidéo (step == 'awaiting_videonote') → délègue à handle_video_note (conversion).
+    - Sinon, comportement normal (diffusion vidéo classique).
+    """
+    message = update.message
+    if message is None or not message.video:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        return
+
+    draft = context.user_data.get('diffusion_draft')
+
+    # Si on attend une note vidéo → conversion
+    if draft and draft.get('step') == 'awaiting_videonote':
+        await handle_video_note(update, context)
+        return
+
+    # Diffusion vidéo classique
+    if draft and draft.get('step') == 'content':
+        draft['video_file_id'] = message.video.file_id
+        if message.caption_html:
+            draft['text'] = message.caption_html
+            draft['step'] = 'extras'
+            await send_transient(
+                context, chat_id,
+                text="🎥 Vidéo enregistrée. Que veux-tu ajouter ?",
+                reply_markup=get_diffusion_extras_keyboard(),
+            )
+        else:
+            context.user_data['awaiting_content_text_after_media'] = 'video'
+            draft['step'] = 'awaiting_content_text'
+            await send_transient(
+                context, chat_id,
+                text="✍️ Envoie maintenant le texte (ou tape /skip pour ne rien mettre) :",
+            )
+        return
+
+    if draft and draft.get('step') == 'awaiting_video':
+        draft['video_file_id'] = message.video.file_id
+        draft['step'] = 'extras'
+        await send_transient(
+            context, chat_id,
+            text="✅ Vidéo ajoutée. Que veux-tu faire d'autre ?",
+            reply_markup=get_diffusion_extras_keyboard(),
+        )
+        return
+
+
+async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Gère les notes vidéo (cercles) :
+    - Si l'admin envoie une VRAIE note vidéo → utilisation directe.
+    - Si l'admin envoie une VIDÉO NORMALE → conversion auto via FFmpeg.
+    - Si l'admin envoie un DOCUMENT vidéo → conversion auto aussi.
+    """
+    message = update.message
+    if message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        return
+
+    file_id = None
+    already_note = False
+
+    if message.video_note:
+        file_id = message.video_note.file_id
+        already_note = True
+    elif message.video:
+        file_id = message.video.file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("video"):
+        file_id = message.document.file_id
+    else:
+        return
+
+    draft = context.user_data.get('diffusion_draft')
+    if not draft:
+        return
+
+    # Cas 1 : composition initiale
+    if draft.get('step') == 'content':
+        if already_note:
+            draft['video_note_file_id'] = file_id
+            draft['step'] = 'extras'
+            await send_transient(
+                context, chat_id,
+                text="⭕ Note vidéo enregistrée. Que veux-tu ajouter ?",
+                reply_markup=get_diffusion_extras_keyboard(),
+            )
+        else:
+            await send_transient(context, chat_id, text="⏳ Conversion en cercle en cours...")
+            converted_path = await download_and_convert_to_video_note(context, file_id, message.message_id)
+            if not converted_path:
+                await send_transient(
+                    context, chat_id,
+                    text="❌ Échec de la conversion. Vérifie que FFmpeg est installé.",
+                    reply_markup=get_diffusion_extras_keyboard(),
+                )
+                return
+            try:
+                with open(converted_path, "rb") as f:
+                    sent_vn = await context.bot.send_video_note(
+                        chat_id=chat_id, video_note=f,
+                        reply_to_message_id=message.message_id,
+                    )
+                draft['video_note_file_id'] = sent_vn.video_note.file_id
+                draft['step'] = 'extras'
+                await send_transient(
+                    context, chat_id,
+                    text="✅ Vidéo convertie en cercle et enregistrée. Que veux-tu ajouter ?",
+                    reply_markup=get_diffusion_extras_keyboard(),
+                )
+            finally:
+                try:
+                    os.remove(converted_path)
+                except Exception:
+                    pass
+        return
+
+    # Cas 2 : on attend spécifiquement une note vidéo
+    if draft.get('step') == 'awaiting_videonote':
+        if already_note:
+            draft['video_note_file_id'] = file_id
+            draft['step'] = 'extras'
+            await send_transient(
+                context, chat_id,
+                text="✅ Note vidéo ajoutée. Que veux-tu faire d'autre ?",
+                reply_markup=get_diffusion_extras_keyboard(),
+            )
+        else:
+            await send_transient(context, chat_id, text="⏳ Conversion en cercle en cours...")
+            converted_path = await download_and_convert_to_video_note(context, file_id, message.message_id)
+            if not converted_path:
+                await send_transient(
+                    context, chat_id,
+                    text="❌ Échec de la conversion. Vérifie que FFmpeg est installé.",
+                    reply_markup=get_diffusion_extras_keyboard(),
+                )
+                return
+            try:
+                with open(converted_path, "rb") as f:
+                    sent_vn = await context.bot.send_video_note(
+                        chat_id=chat_id, video_note=f,
+                        reply_to_message_id=message.message_id,
+                    )
+                draft['video_note_file_id'] = sent_vn.video_note.file_id
+                draft['step'] = 'extras'
+                await send_transient(
+                    context, chat_id,
+                    text="✅ Vidéo convertie en cercle et ajoutée. Que veux-tu faire d'autre ?",
+                    reply_markup=get_diffusion_extras_keyboard(),
+                )
+            finally:
+                try:
+                    os.remove(converted_path)
+                except Exception:
+                    pass
+        return
+
+
 async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Relais des messages texte libres, avec deux mécanismes possibles :
-
-    1) Groupe de support avec Topics (si SUPPORT_GROUP_ID configuré) : chaque visiteur a son
-       propre fil de discussion. Tout message envoyé dans ce fil (par un admin/membre du
-       groupe) est renvoyé au visiteur correspondant. C'est le mode prioritaire.
-
-    2) Mode direct (si seul ADMIN_CHAT_ID est configuré) : les messages des visiteurs sont
-       transférés au chat privé de l'admin, qui répond via "Répondre" (reply) sur le message.
-
-    Dans tous les cas, chaque échange est aussi journalisé pour la commande /historique.
-    """
+    """Relais des messages texte + gestion étapes de composition texte."""
     message = update.message
     if message is None or not message.text:
         return
 
     chat_id = update.effective_chat.id
-
-    # --- Cas -1 : raccourci du clavier persistant (Menu / Stats / Diffusion / Aide) ---
     incoming_text = message.text.strip()
     logger.info(f"Message reçu de {chat_id} (admin={is_admin(chat_id)}) : {incoming_text!r}")
 
+    # --- Cas -2 : texte attendu après média ---
+    if is_admin(chat_id):
+        draft = context.user_data.get('diffusion_draft')
+        if draft and draft.get('step') == 'awaiting_content_text':
+            media_type = context.user_data.pop('awaiting_content_text_after_media', None)
+            if incoming_text.lower() == '/skip':
+                draft['text'] = None
+            else:
+                draft['text'] = message.text_html
+            draft['step'] = 'extras'
+            label = "photo" if media_type == 'photo' else "vidéo"
+            await send_transient(
+                context, chat_id,
+                text=f"✅ Texte enregistré pour la {label}. Que veux-tu ajouter ?",
+                reply_markup=get_diffusion_extras_keyboard(),
+            )
+            return
+
+    # --- Cas -1 : raccourcis clavier ---
     quick_action = ADMIN_QUICK_ACTIONS.get(incoming_text)
     if quick_action is None:
-        # Repli tolérant : ignore l'emoji/la casse/les espaces au cas où le clavier
-        # afficherait un texte légèrement différent selon l'appareil.
         simplified = re.sub(r'[^\w]', '', incoming_text).lower()
         for label, action_name in ADMIN_QUICK_ACTIONS.items():
             if re.sub(r'[^\w]', '', label).lower() == simplified:
@@ -2614,9 +2883,11 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
     if is_admin(chat_id) and quick_action is not None:
         action = quick_action
 
-        # Un raccourci abandonne toute composition en cours (diffusion, capture)
         context.user_data['diffusion_draft'] = None
         context.user_data['awaiting_capture'] = False
+        context.user_data['poll_draft'] = None
+        context.user_data['diffusion_sending'] = False
+        context.user_data.pop('awaiting_content_text_after_media', None)
         await clear_last_transient(context)
 
         if action == "menu":
@@ -2643,7 +2914,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             )
         return
 
-    # --- Cas -0.5 : l'admin est en train de composer un sondage ---
+    # --- Cas -0.5 : composition sondage ---
     if is_admin(chat_id):
         poll_draft = context.user_data.get('poll_draft')
         if poll_draft and poll_draft.get('step') == 'content':
@@ -2664,7 +2935,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-    # --- Cas 0 : l'admin est en train de composer un post DIFFUSION ---
+    # --- Cas 0 : composition diffusion ---
     if is_admin(chat_id):
         draft = context.user_data.get('diffusion_draft')
         if draft:
@@ -2695,9 +2966,16 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 return
 
             if step == 'awaiting_schedule_time':
-                try:
-                    target_dt = datetime.strptime(message.text.strip(), "%d/%m/%Y %H:%M").replace(tzinfo=TZ)
-                except ValueError:
+                formats = ["%d/%m/%Y %H:%M", "%d/%m/%y %H:%M", "%d-%m-%Y %H:%M", "%Y-%m-%d %H:%M"]
+                target_dt = None
+                for fmt in formats:
+                    try:
+                        target_dt = datetime.strptime(message.text.strip(), fmt).replace(tzinfo=TZ)
+                        break
+                    except ValueError:
+                        continue
+
+                if target_dt is None:
                     await send_transient(
                         context, chat_id,
                         text="⚠️ Format invalide. Utilise JJ/MM/AAAA HH:MM (ex: 25/12/2026 18:30).",
@@ -2712,7 +2990,7 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
 
                 context.job_queue.run_once(
                     scheduled_diffusion_job, when=target_dt,
-                    data={'draft': dict(draft), 'admin_chat_id': chat_id},
+                    data={'draft': copy.deepcopy(draft), 'admin_chat_id': chat_id},
                     name=f"scheduled_diffusion_{chat_id}_{target_dt.timestamp()}",
                 )
                 context.user_data['diffusion_draft'] = None
@@ -2722,13 +3000,12 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 return
 
-    # --- Cas 1 : message envoyé DANS le groupe de support (dans un topic donné) ---
+    # --- Cas 1 : groupe de support (topics) ---
     if SUPPORT_GROUP_ID is not None and chat_id == SUPPORT_GROUP_ID:
         thread_id = message.message_thread_id
         if thread_id is None:
-            return  # message hors sujet (fil général du groupe) : on ignore
+            return
 
-        # Ignore les messages qui sont eux-mêmes des transferts (l'écho du message du visiteur)
         is_forward = bool(getattr(message, 'forward_origin', None) or getattr(message, 'forward_date', None))
         if is_forward:
             return
@@ -2742,10 +3019,14 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             await send_to_visitor(context, target_key, message.text_html, parse_mode="HTML")
             log_conversation(context, target_key, 'admin', message.text)
         except Exception as e:
+            logger.warning(f"Échec d'envoi au topic {thread_id} : {e}. Recréation si possible.")
+            topics = context.bot_data.get('visitor_topics', {})
+            topics.pop(target_key, None)
+            reverse.pop(thread_id, None)
             await message.reply_text(f"❌ Échec de l'envoi : {e}")
         return
 
-    # --- Cas 2 : l'admin écrit en privé au bot (mode direct, sans groupe) ---
+    # --- Cas 2 : admin écrit en privé au bot (reply) ---
     if is_admin(chat_id):
         reply_to = message.reply_to_message
         if reply_to:
@@ -2759,56 +3040,45 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 except Exception as e:
                     await message.reply_text(f"❌ Échec de l'envoi : {e}")
                 return
-        # Message de l'admin qui n'est pas une réponse à un visiteur : on l'ignore simplement.
         return
 
-    # --- Cas 3 : message venant d'un visiteur ---
-
+    # --- Cas 3 : visiteur ---
     if is_blocked(context, chat_id):
-        return  # Utilisateur bloqué (/block) : on l'ignore silencieusement
+        return
 
     sender = update.effective_user
     sender_name = sender.full_name if sender else "Inconnu"
     username = f"@{sender.username}" if sender and sender.username else "(pas de pseudo)"
 
-    # Si le visiteur a écrit "en tant que canal" (Messages directs), Telegram fournit un
-    # direct_messages_topic : on construit alors une clé unique par abonné (voir make_visitor_key),
-    # car plusieurs abonnés différents peuvent partager le même chat_id dans ce mode.
     dm_topic = getattr(message, 'direct_messages_topic', None)
     dm_topic_id = dm_topic.topic_id if dm_topic is not None else None
     visitor_key = make_visitor_key(chat_id, dm_topic_id)
 
     if is_rate_limited(context, visitor_key):
-        return  # Anti-spam : trop de messages en peu de temps, on ignore silencieusement
+        return
 
     if ADMIN_CHAT_ID is None and SUPPORT_GROUP_ID is None:
-        return  # Aucune des deux fonctionnalités n'est configurée
+        return
 
     remember_known_user(context, visitor_key)
     log_conversation(context, visitor_key, 'visitor', message.text)
 
-    # Priorité au groupe avec Topics s'il est configuré et fonctionnel
     if SUPPORT_GROUP_ID is not None:
         thread_id = await get_or_create_topic(context, visitor_key, sender_name, username)
         if thread_id is not None:
             try:
                 await context.bot.forward_message(
-                    chat_id=SUPPORT_GROUP_ID,
-                    from_chat_id=chat_id,
-                    message_id=message.message_id,
-                    message_thread_id=thread_id,
+                    chat_id=SUPPORT_GROUP_ID, from_chat_id=chat_id,
+                    message_id=message.message_id, message_thread_id=thread_id,
                 )
             except Exception as e:
                 logger.warning(f"Échec de relais (topic) du message de {visitor_key} : {e}")
             return
-        # Si la création/récupération du topic échoue, on retombe sur le mode direct ci-dessous
 
-    # Repli : mode direct vers le chat privé de l'admin
     if ADMIN_CHAT_ID is not None:
         try:
             forwarded = await context.bot.forward_message(
-                chat_id=ADMIN_CHAT_ID,
-                from_chat_id=chat_id,
+                chat_id=ADMIN_CHAT_ID, from_chat_id=chat_id,
                 message_id=message.message_id,
             )
             note = await context.bot.send_message(
@@ -2816,16 +3086,17 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 text=f"☝️ Message de {sender_name} {username} (clé: {visitor_key})\nRéponds à ce message pour lui répondre.",
                 reply_to_message_id=forwarded.message_id,
             )
-            relay_map = context.bot_data.setdefault('relay_map', {})
+            relay_map = context.bot_data.setdefault('relay_map', OrderedDict())
             relay_map[forwarded.message_id] = visitor_key
             relay_map[note.message_id] = visitor_key
+            while len(relay_map) > 500:
+                relay_map.popitem(last=False)
         except Exception as e:
             logger.warning(f"Échec de relais du message de {visitor_key} : {e}")
             return
 
 
 async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /block <chat_id> : bloque un visiteur (admin uniquement)."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Réservé à l'administrateur.")
@@ -2843,7 +3114,6 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /unblock <chat_id> : débloque un visiteur (admin uniquement)."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Réservé à l'administrateur.")
@@ -2861,10 +3131,10 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def is_rate_limited(context: ContextTypes.DEFAULT_TYPE, visitor_key: str) -> bool:
-    """Anti-spam simple : max RATE_LIMIT_MAX_MESSAGES messages par RATE_LIMIT_WINDOW_SECONDS."""
+    """Rate limiting en mémoire volatile (non persistée)."""
     now_ts = datetime.now(TZ).timestamp()
-    all_timestamps = context.bot_data.setdefault('rate_limit', {})
-    timestamps = all_timestamps.setdefault(visitor_key, [])
+    cache = context.application.bot_data.setdefault('_rate_limit_cache', {})
+    timestamps = cache.setdefault(visitor_key, [])
     cutoff = now_ts - RATE_LIMIT_WINDOW_SECONDS
     while timestamps and timestamps[0] < cutoff:
         timestamps.pop(0)
@@ -2875,7 +3145,6 @@ def is_rate_limited(context: ContextTypes.DEFAULT_TYPE, visitor_key: str) -> boo
 
 
 async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /reset_all : réinitialise tout l'historique, avec double confirmation."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Réservé à l'administrateur.")
@@ -2885,14 +3154,12 @@ async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Non, annuler", callback_data="cancel_resetall")],
     ])
     await update.message.reply_text(
-        "⚠️ Ceci va effacer TOUT l'historique (session gratuite + les 4 sous-sessions VIP). "
-        "Es-tu sûr ?",
+        "⚠️ Ceci va effacer TOUT l'historique (session gratuite + les 4 sous-sessions VIP). Es-tu sûr ?",
         reply_markup=keyboard,
     )
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /broadcast <message> : envoie un message à tous les utilisateurs connus (admin uniquement)."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Réservé à l'administrateur.")
@@ -2904,11 +3171,15 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     known_users = context.bot_data.get('known_users', set())
+    seen_chat_ids = set()
     sent, failed = 0, 0
     for uid in known_users:
         uid_chat_id, _ = parse_visitor_key(uid)
         if uid_chat_id == ADMIN_CHAT_ID:
             continue
+        if uid_chat_id in seen_chat_ids:
+            continue
+        seen_chat_ids.add(uid_chat_id)
         try:
             await send_to_visitor(context, uid, text)
             sent += 1
@@ -2920,7 +3191,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /historique <chat_id> : affiche tout l'échange enregistré avec ce visiteur."""
     chat_id = update.effective_chat.id
     if not is_admin(chat_id):
         await update.message.reply_text("⛔ Réservé à l'administrateur.")
@@ -2953,15 +3223,36 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     full_text = f"🗂️ Historique avec {target} :\n\n" + "\n".join(lines)
 
-    # Découpage si le texte dépasse la limite d'un message Telegram
     max_len = 3500
     for i in range(0, len(full_text), max_len):
         await update.message.reply_text(full_text[i:i + max_len])
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log des erreurs rencontrées."""
     logger.error("Exception rencontrée lors du traitement d'une mise à jour :", exc_info=context.error)
+
+
+async def on_startup(app):
+    """Nettoyage des caches volatils au démarrage + vérif FFmpeg."""
+    app.bot_data['_rate_limit_cache'] = {}
+    if not isinstance(app.bot_data.get('relay_map'), OrderedDict):
+        app.bot_data['relay_map'] = OrderedDict(app.bot_data.get('relay_map', {}))
+    logger.info("Caches volatils initialisés.")
+
+    # Vérification FFmpeg
+    try:
+        result = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            logger.info(f"✅ FFmpeg détecté : {FFMPEG_PATH}")
+        else:
+            logger.warning("⚠️ FFmpeg présent mais retourne une erreur.")
+    except Exception as e:
+        logger.warning(
+            f"⚠️ FFmpeg introuvable ou non fonctionnel ({e}). "
+            f"La conversion vidéo → note vidéo sera indisponible. "
+            f"Installe-le : pkg install ffmpeg (Termux) / apt install ffmpeg (Linux) / "
+            f"brew install ffmpeg (macOS) / ffmpeg.exe (Windows)."
+        )
 
 
 def main():
@@ -2970,14 +3261,12 @@ def main():
 
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
 
-    # Requêtes API avec timeouts généreux (utile sur connexion mobile lente/instable)
     api_request = HTTPXRequest(
         connect_timeout=CONNECT_TIMEOUT,
         read_timeout=READ_TIMEOUT,
         write_timeout=CONNECT_TIMEOUT,
         pool_timeout=CONNECT_TIMEOUT,
     )
-    # Le long polling (get_updates) garde la connexion ouverte plus longtemps : lecture élargie
     polling_request = HTTPXRequest(
         connect_timeout=CONNECT_TIMEOUT,
         read_timeout=READ_TIMEOUT + 10,
@@ -2989,6 +3278,7 @@ def main():
         .persistence(persistence)
         .request(api_request)
         .get_updates_request(polling_request)
+        .post_init(on_startup)
         .build()
     )
 
@@ -3003,18 +3293,16 @@ def main():
     app.add_handler(CommandHandler("unblock", unblock_command))
     app.add_handler(CallbackQueryHandler(handle_button_click))
     app.add_handler(MessageHandler(filters.PHOTO, handle_capture_photo))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.Document.VIDEO, handle_video_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_incoming_message))
 
-    # Gestionnaire d'erreurs
     app.add_error_handler(error_handler)
 
-    # Reset quotidien automatique (optionnel, désactivé par défaut)
     if DAILY_RESET_ENABLED:
         if app.job_queue is None:
-            logger.warning(
-                "JobQueue indisponible : installez 'python-telegram-bot[job-queue]' "
-                "pour activer le reset quotidien automatique."
-            )
+            logger.warning("JobQueue indisponible : installez 'python-telegram-bot[job-queue]'.")
         else:
             app.job_queue.run_daily(
                 daily_reset_job,
@@ -3022,10 +3310,9 @@ def main():
             )
             logger.info(f"Reset quotidien programmé à {DAILY_RESET_HOUR:02d}:00 ({TIMEZONE_NAME}).")
 
-    # Sauvegarde automatique quotidienne (activée par défaut)
     if BACKUP_ENABLED:
         if app.job_queue is None:
-            logger.warning("JobQueue indisponible : la sauvegarde automatique ne peut pas être programmée.")
+            logger.warning("JobQueue indisponible : sauvegarde auto non programmée.")
         else:
             app.job_queue.run_daily(
                 backup_persistence_job,
@@ -3033,31 +3320,34 @@ def main():
             )
             logger.info(f"Sauvegarde automatique programmée à {BACKUP_HOUR:02d}:00 ({TIMEZONE_NAME}).")
 
-    # Rappel automatique de canal pour les visiteurs non abonnés (si un canal est configuré)
+    if app.job_queue is not None:
+        app.job_queue.run_daily(
+            cleanup_inactive_job,
+            time=dt_time(hour=4, minute=0, tzinfo=TZ),
+        )
+        logger.info("Purge des visiteurs inactifs programmée à 04:00.")
+
     if CHANNEL_CHAT_ID is not None:
         if app.job_queue is None:
-            logger.warning("JobQueue indisponible : le rappel automatique de canal ne peut pas être programmé.")
+            logger.warning("JobQueue indisponible : rappel canal non programmé.")
         else:
             app.job_queue.run_daily(
                 channel_reminder_job,
                 time=dt_time(hour=12, minute=0, tzinfo=TZ),
             )
-            logger.info(f"Rappel automatique de canal programmé (après {CHANNEL_REMINDER_DAYS} jour(s) d'inactivité).")
+            logger.info(f"Rappel automatique de canal programmé (après {CHANNEL_REMINDER_DAYS} jour(s)).")
 
     logger.info(f"Système détecté : {SYSTEM_OS} (Python {platform.python_version()})")
     logger.info(f"Persistance activée : {PERSISTENCE_FILE}")
     if ALLOWED_CHAT_IDS:
         logger.info(f"Accès restreint à {len(ALLOWED_CHAT_IDS)} chat_id(s).")
     else:
-        logger.info("Aucune restriction d'accès configurée (ALLOWED_CHAT_IDS vide).")
+        logger.info("Aucune restriction d'accès configurée.")
 
     if ADMIN_CHAT_ID is not None:
-        logger.info(f"Relais des messages activé vers l'administrateur (chat_id={ADMIN_CHAT_ID}).")
+        logger.info(f"Relais admin activé (chat_id={ADMIN_CHAT_ID}).")
     else:
-        logger.warning(
-            "ADMIN_CHAT_ID non configuré : les messages reçus des visiteurs ne seront pas relayés. "
-            "Ajoute ADMIN_CHAT_ID dans le .env pour activer cette fonctionnalité."
-        )
+        logger.warning("ADMIN_CHAT_ID non configuré : relais désactivé.")
 
     if SUPPORT_GROUP_ID is not None:
         logger.info(f"Groupe de support avec Topics activé (chat_id={SUPPORT_GROUP_ID}).")
@@ -3068,13 +3358,14 @@ def main():
         if CHANNEL_INVITE_LINK:
             logger.info(f"Rappel d'abonnement au canal activé (chat_id={CHANNEL_CHAT_ID}).")
         else:
-            logger.warning(
-                f"CHANNEL_CHAT_ID configuré ({CHANNEL_CHAT_ID}) mais CHANNEL_INVITE_LINK est vide : "
-                "le bouton 'Rejoindre le canal' ne sera pas affiché. Renseigne CHANNEL_INVITE_LINK "
-                "dans le .env (utile notamment pour les canaux privés)."
-            )
+            logger.warning(f"CHANNEL_CHAT_ID configuré ({CHANNEL_CHAT_ID}) mais CHANNEL_INVITE_LINK vide.")
     else:
-        logger.info("CHANNEL_CHAT_ID non configuré : pas de rappel d'abonnement au canal.")
+        logger.info("CHANNEL_CHAT_ID non configuré.")
+
+    if VIP_CHANNEL_CHAT_ID is not None:
+        logger.info(f"Canal VIP configuré : cibles VIP/NON VIP disponibles.")
+    else:
+        logger.info("VIP_CHANNEL_CHAT_ID non configuré : 'VIP' et 'NON VIP' fusionneront vers 'TOUS'.")
 
     logger.info("Bot prêt et démarré !")
 
@@ -3082,10 +3373,9 @@ def main():
         app.run_polling()
     except (NetworkError, TimedOut) as e:
         logger.error(
-            "Impossible de contacter Telegram (api.telegram.org). Vérifiez : "
-            "1) votre connexion internet, 2) qu'un VPN n'est pas nécessaire "
-            "(Telegram est bloqué dans certains pays/réseaux), 3) qu'aucun pare-feu "
-            f"ne bloque l'application. Détail technique : {e}"
+            "Impossible de contacter Telegram (api.telegram.org). Vérifie : "
+            "1) connexion internet, 2) VPN si Telegram est bloqué, 3) pare-feu. "
+            f"Détail : {e}"
         )
     except KeyboardInterrupt:
         logger.info("Arrêt du bot demandé par l'utilisateur.")
