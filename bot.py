@@ -9,6 +9,7 @@ import asyncio
 import platform
 import random
 import logging
+import warnings
 import subprocess
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict, OrderedDict
@@ -36,12 +37,27 @@ from telegram.ext import (
 # --- Détection du système d'exploitation ---
 SYSTEM_OS = platform.system()
 
+# ============================================================
+# 🌍 CONFIGURATION MULTI-OS
+# ============================================================
+
+# Windows : ré-encoder stdout/stderr en UTF-8 pour éviter UnicodeEncodeError
 if SYSTEM_OS == "Windows":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+# macOS : ajoute les chemins Homebrew/usr/local au PATH (IDE, launchd, etc.)
+if SYSTEM_OS == "Darwin":
+    _mac_paths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/sbin"]
+    _current_path = os.environ.get("PATH", "")
+    for _p in reversed(_mac_paths):
+        if os.path.isdir(_p) and _p not in _current_path.split(os.pathsep):
+            os.environ["PATH"] = _p + os.pathsep + os.environ["PATH"]
+    # Suppression des warnings asyncio sous macOS (Ctrl+C, signal handlers…)
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -138,29 +154,79 @@ def normalize_broadcast_target(target: str):
     return t
 
 
-# --- Hébergement d'images pour la diffusion (catbox.moe) ---
+# ============================================================
+# HÉBERGEMENT D'IMAGES — Catbox → 0x0.st → Freeimage
+# Timeout 20s par hébergeur, animation visible
+# ============================================================
+
 CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
+UPLOAD_TIMEOUT_PER_PROVIDER = 20  # secondes max par hébergeur
 
 
-async def upload_to_catbox(file_bytes: bytes, filename: str = "image.jpg", retries: int = 3) -> str:
-    """Upload vers catbox.moe avec retry exponentiel."""
-    last_error = None
-    for attempt in range(retries):
+async def upload_to_catbox(file_bytes: bytes, filename: str = "image.jpg") -> str:
+    """Upload vers catbox.moe."""
+    async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT_PER_PROVIDER) as client:
+        files = {"fileToUpload": (filename, file_bytes, "image/jpeg")}
+        data = {"reqtype": "fileupload"}
+        resp = await client.post(CATBOX_UPLOAD_URL, data=data, files=files)
+        resp.raise_for_status()
+        url = resp.text.strip()
+        if not url.startswith("http"):
+            raise ValueError(f"Réponse inattendue de catbox.moe : {url}")
+        return url
+
+
+async def upload_to_0x0(file_bytes: bytes, filename: str = "image.jpg") -> str:
+    """Upload vers 0x0.st."""
+    async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT_PER_PROVIDER) as client:
+        files = {"file": (filename, file_bytes, "image/jpeg")}
+        resp = await client.post("https://0x0.st", files=files)
+        resp.raise_for_status()
+        url = resp.text.strip()
+        if not url.startswith("http"):
+            raise ValueError(f"Réponse inattendue de 0x0.st : {url}")
+        return url
+
+
+async def upload_to_freeimage(file_bytes: bytes, filename: str = "image.jpg") -> str:
+    """Upload vers freeimage.host."""
+    async with httpx.AsyncClient(timeout=UPLOAD_TIMEOUT_PER_PROVIDER) as client:
+        files = {"source": (filename, file_bytes, "image/jpeg")}
+        resp = await client.post(
+            "https://freeimage.host/api/1/upload",
+            params={"key": "6d207e02198a847aa98d0a2a901485a5"},
+            files=files,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("image", {}).get("url"):
+            raise ValueError(f"Réponse inattendue de Freeimage.host : {data}")
+        return data["image"]["url"]
+
+
+async def upload_image_with_fallback(file_bytes: bytes, filename: str = "image.jpg") -> str:
+    """Cascade simple sans affichage (utilisée dans les contextes non interactifs)."""
+    providers = [
+        ("Catbox", upload_to_catbox),
+        ("0x0.st", upload_to_0x0),
+        ("Freeimage", upload_to_freeimage),
+    ]
+    errors = []
+    for name, fn in providers:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                files = {"fileToUpload": (filename, file_bytes, "image/jpeg")}
-                data = {"reqtype": "fileupload"}
-                resp = await client.post(CATBOX_UPLOAD_URL, data=data, files=files)
-                resp.raise_for_status()
-                url = resp.text.strip()
-                if not url.startswith("http"):
-                    raise ValueError(f"Réponse inattendue de catbox.moe : {url}")
-                return url
+            url = await asyncio.wait_for(
+                fn(file_bytes, filename),
+                timeout=UPLOAD_TIMEOUT_PER_PROVIDER,
+            )
+            logger.info(f"✅ Image hébergée sur {name} : {url}")
+            return url
+        except asyncio.TimeoutError:
+            errors.append(f"{name}: timeout {UPLOAD_TIMEOUT_PER_PROVIDER}s")
+            logger.warning(f"⏱️ {name} timeout, bascule au suivant")
         except Exception as e:
-            last_error = e
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-    raise last_error
+            errors.append(f"{name}: {e}")
+            logger.warning(f"❌ {name} échoué, bascule au suivant : {e}")
+    raise Exception("Tous les hébergeurs ont échoué : " + " | ".join(errors))
 
 
 # Dossiers d'images
@@ -168,21 +234,39 @@ DIR_IMG = "IMG"
 DIR_WIN = "IMG_WIN"
 DIR_LOSE = "IMG_LOSE"
 
-# 🔧 Dossier temporaire pour la conversion vidéo → note vidéo
+# Dossier temporaire pour la conversion vidéo → note vidéo
 TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_cercle")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 def _find_ffmpeg() -> str:
-    """Cherche ffmpeg dans le PATH, sinon dans le dossier du bot (Windows : ffmpeg.exe)."""
+    """
+    Cherche ffmpeg dans l'ordre :
+      1. Chemins Homebrew macOS (Apple Silicon puis Intel)
+      2. /usr/local/bin (installation manuelle macOS / Linux)
+      3. PATH système
+      4. Dossier du bot
+      5. Fallback : "ffmpeg" (espérant qu'il soit dans le PATH au runtime)
+    """
     ffmpeg_name = "ffmpeg.exe" if SYSTEM_OS == "Windows" else "ffmpeg"
     from shutil import which
+
+    # macOS : chemins prioritaires
+    if SYSTEM_OS == "Darwin":
+        for path in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if os.path.exists(path):
+                return path
+
+    # Recherche dans le PATH
     found = which(ffmpeg_name)
     if found:
         return found
+
+    # Dossier du bot
     local = os.path.join(os.path.dirname(os.path.abspath(__file__)), ffmpeg_name)
     if os.path.exists(local):
         return local
+
     return ffmpeg_name
 
 
@@ -348,7 +432,6 @@ async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, visitor_key: s
 def remember_broadcast(context: ContextTypes.DEFAULT_TYPE, *, kind: str, text: str = None,
                         photo_file_id: str = None, video_file_id: str = None,
                         video_note_file_id: str = None, parse_mode: str = None):
-    """Mémorise le dernier contenu envoyé pour la diffusion automatique."""
     context.user_data['last_broadcast'] = {
         'kind': kind,
         'text': text,
@@ -360,7 +443,6 @@ def remember_broadcast(context: ContextTypes.DEFAULT_TYPE, *, kind: str, text: s
 
 
 async def auto_broadcast_last(context: ContextTypes.DEFAULT_TYPE):
-    """Diffuse automatiquement le dernier contenu vers la cible active de la session."""
     target_setting = context.user_data.get('active_broadcast_target')
     if not target_setting:
         return
@@ -408,7 +490,6 @@ _BUTTON_STYLE_WORDS = {
 
 
 def parse_diffusion_buttons(text: str):
-    """Parse le format de boutons façon Controller Bot (regex robuste aux tirets)."""
     rows = []
     for line in text.strip().splitlines():
         line = line.strip()
@@ -445,7 +526,6 @@ RANDOM_BUTTON_STYLES = ["success", "danger", "primary"]
 
 
 def build_diffusion_markup(button_rows: list):
-    """Construit un InlineKeyboardMarkup à partir des rangées."""
     if not button_rows:
         return None
     keyboard = []
@@ -458,15 +538,8 @@ def build_diffusion_markup(button_rows: list):
     return InlineKeyboardMarkup(keyboard)
 
 
-# 🔧 Conversion vidéo normale → note vidéo (cercle) via FFmpeg
+# --- Conversion vidéo normale → note vidéo (cercle) via FFmpeg ---
 def convertir_en_cercle(input_path: str, output_path: str) -> bool:
-    """
-    Convertit une vidéo en format 'video note' (cercle) compatible Telegram.
-    - Recadre en carré (1:1)
-    - Redimensionne à 384x384
-    - Limite à 60 secondes
-    - Encode en H.264 + AAC
-    """
     cmd = [
         FFMPEG_PATH, "-y",
         "-i", input_path,
@@ -487,9 +560,9 @@ def convertir_en_cercle(input_path: str, output_path: str) -> bool:
     except FileNotFoundError:
         logger.warning(
             "❌ FFmpeg introuvable. Installe-le :\n"
+            "  - macOS : brew install ffmpeg  (ou téléchargement manuel dans /usr/local/bin)\n"
             "  - Termux : pkg install ffmpeg\n"
             "  - Linux : sudo apt install ffmpeg\n"
-            "  - macOS : brew install ffmpeg\n"
             "  - Windows : télécharge ffmpeg.exe et place-le dans le dossier du bot"
         )
         return False
@@ -501,10 +574,6 @@ def convertir_en_cercle(input_path: str, output_path: str) -> bool:
 async def download_and_convert_to_video_note(
     context: ContextTypes.DEFAULT_TYPE, file_id: str, message_id: int
 ):
-    """
-    Télécharge un fichier Telegram et le convertit en note vidéo (cercle).
-    Retourne le chemin du fichier converti, ou None en cas d'échec.
-    """
     input_path = os.path.join(TEMP_DIR, f"in_{message_id}.mp4")
     output_path = os.path.join(TEMP_DIR, f"out_{message_id}.mp4")
 
@@ -528,10 +597,6 @@ async def download_and_convert_to_video_note(
 
 
 async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: dict, dm_topic_id=None) -> list:
-    """
-    Envoie le post composé via DIFFUSION vers une destination.
-    Supporte : photo, vidéo, note vidéo (cercle), texte seul.
-    """
     options = draft.get('options') or DEFAULT_DIFFUSION_OPTIONS
     raw_text = draft.get('text')
 
@@ -552,7 +617,6 @@ async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: d
     if dm_topic_id is not None:
         extra['direct_messages_topic_id'] = dm_topic_id
 
-    # Priorité : note vidéo > vidéo > photo > texte
     if video_note_file_id:
         sent_vn = await context.bot.send_video_note(
             chat_id=dest, video_note=video_note_file_id, **extra,
@@ -593,7 +657,6 @@ async def send_diffusion_post(context: ContextTypes.DEFAULT_TYPE, dest, draft: d
 
 
 async def show_diffusion_preview(context: ContextTypes.DEFAULT_TYPE, chat_id, draft: dict):
-    """Envoie un aperçu exact du post avant confirmation."""
     try:
         await send_diffusion_post(context, chat_id, draft)
     except Exception as e:
@@ -607,7 +670,6 @@ async def show_diffusion_preview(context: ContextTypes.DEFAULT_TYPE, chat_id, dr
 
 
 async def diffuse_capture_photo(context: ContextTypes.DEFAULT_TYPE, photo_file_id: str):
-    """Diffuse une capture d'écran vers la cible active."""
     target_setting = context.user_data.get('active_broadcast_target')
     if not target_setting:
         return
@@ -777,7 +839,6 @@ def format_full_vip_report(vip_history: dict) -> str:
 
 
 def generate_performance_chart(entries: list):
-    """Génère un graphique PNG (import paresseux de matplotlib)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -995,38 +1056,40 @@ def get_session_broadcast_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_subscribers_submenu_keyboard(prefix: str, cancel_callback: str) -> InlineKeyboardMarkup:
-    """Sous-menu des abonnés : VIP / NON VIP / TOUS."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👑 VIP", callback_data=f"{prefix}_vip_only")],
-        [InlineKeyboardButton("🆓 NON VIP", callback_data=f"{prefix}_non_vip_only")],
-        [InlineKeyboardButton("👥 TOUS", callback_data=f"{prefix}_all_subscribers")],
-        [styled_button("❌ Annuler", style="danger", callback_data=cancel_callback)],
+def get_target_keyboard(prefix: str, cancel_callback: str) -> InlineKeyboardMarkup:
+    """
+    Clavier de choix de cible réutilisable (diffusion, sondage, stats).
+    Structure :
+      - 1 bouton par BROADCAST_TARGET
+      - 1 ligne [📤 TOUS]
+      - 1 ligne [👑 VIP] [🚫 NON VIP]
+      - 1 ligne [👥 TOUS ABONNÉS]
+      - 1 ligne [❌ Annuler]
+    """
+    keyboard = []
+    for i, target in enumerate(BROADCAST_TARGETS):
+        keyboard.append([InlineKeyboardButton(f"📡 {target}", callback_data=f"{prefix}_target_{i}")])
+    if BROADCAST_TARGETS:
+        keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data=f"{prefix}_all")])
+    keyboard.append([
+        InlineKeyboardButton("👑 VIP", callback_data=f"{prefix}_vip_only"),
+        InlineKeyboardButton("🚫 NON VIP", callback_data=f"{prefix}_non_vip_only"),
     ])
+    keyboard.append([InlineKeyboardButton("👥 TOUS ABONNÉS", callback_data=f"{prefix}_all_subscribers")])
+    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data=cancel_callback)])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def get_diffusion_target_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton(f"📡 {target}", callback_data=f"diffchoice_target_{i}")]
-        for i, target in enumerate(BROADCAST_TARGETS)
-    ]
-    if BROADCAST_TARGETS:
-        keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="diffchoice_all")])
-    keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="diffchoice_subscribers")])
-    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="diffchoice_cancel")])
-    return InlineKeyboardMarkup(keyboard)
+    return get_target_keyboard("diffchoice", "diffchoice_cancel")
 
 
 def get_poll_target_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton(f"📡 {target}", callback_data=f"polltarget_idx_{i}")]
-        for i, target in enumerate(BROADCAST_TARGETS)
-    ]
-    if BROADCAST_TARGETS:
-        keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="polltarget_all")])
-    keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="polltarget_subscribers")])
-    keyboard.append([styled_button("❌ Annuler", style="danger", callback_data="polltarget_cancel")])
-    return InlineKeyboardMarkup(keyboard)
+    return get_target_keyboard("polltarget", "polltarget_cancel")
+
+
+def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
+    return get_target_keyboard("statdiff", "diffchoice_cancel")
 
 
 def parse_poll_spec(text: str):
@@ -1036,18 +1099,6 @@ def parse_poll_spec(text: str):
     question = parts[0]
     options = parts[1:][:10]
     return question, options
-
-
-def get_stats_diffusion_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton(f"📡 {target}", callback_data=f"statdiff_target_{i}")]
-        for i, target in enumerate(BROADCAST_TARGETS)
-    ]
-    if BROADCAST_TARGETS:
-        keyboard.append([InlineKeyboardButton("📤 TOUS", callback_data="statdiff_all")])
-    keyboard.append([InlineKeyboardButton("👥 ABONNÉS", callback_data="statdiff_subscribers")])
-    keyboard.append([InlineKeyboardButton("📈 Graphique de performance", callback_data="stats_chart")])
-    return InlineKeyboardMarkup(keyboard)
 
 
 def filter_entries_by_period(entries: list, days: int) -> list:
@@ -1206,10 +1257,7 @@ async def send_photo_safe(bot, chat_id, image_path, caption, reply_markup, parse
     )
 
 
-# --- HELPERS POUR LES CIBLES D'ABONNÉS (VIP / NON VIP / TOUS) ---
-
 async def get_subscriber_targets(context: ContextTypes.DEFAULT_TYPE, mode: str):
-    """Retourne les destinations selon le mode : 'all', 'vip_only', 'non_vip_only'."""
     known = context.bot_data.get('known_users', set())
 
     if mode == 'all':
@@ -1248,6 +1296,153 @@ async def get_subscriber_targets(context: ContextTypes.DEFAULT_TYPE, mode: str):
         destinations.append((d_chat_id, d_topic_id))
 
     return destinations
+
+
+# ============================================================
+# UPLOAD AVEC ANIMATION VISIBLE
+# ============================================================
+
+UPLOAD_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+async def upload_with_progress_display(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    file_bytes: bytes,
+    filename: str = "image.jpg",
+) -> str:
+    """
+    Cascade d'upload (Catbox → 0x0.st → Freeimage) avec affichage live :
+      - Message unique édité en place
+      - Spinner animé + compteur de secondes écoulées
+      - Timeout UPLOAD_TIMEOUT_PER_PROVIDER par hébergeur
+      - Bascule automatique au suivant en cas d'échec/timeout
+    """
+    providers = [
+        ("Catbox", upload_to_catbox),
+        ("0x0.st", upload_to_0x0),
+        ("Freeimage", upload_to_freeimage),
+    ]
+    total = len(providers)
+    errors = []
+
+    # Message d'état initial
+    try:
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⏳ Hébergement en cours...\n\n"
+                f"🔄 1/{total} → Catbox\n"
+                f"⏱️ 0s / {UPLOAD_TIMEOUT_PER_PROVIDER}s"
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"Impossible d'afficher le statut d'upload : {e}")
+        status_msg = None
+
+    def build_status(name: str, idx: int, elapsed: int) -> str:
+        spinner = UPLOAD_SPINNER[elapsed % len(UPLOAD_SPINNER)]
+        return (
+            f"⏳ Hébergement en cours...\n\n"
+            f"{spinner} {idx}/{total} → {name}\n"
+            f"⏱️ {elapsed}s / {UPLOAD_TIMEOUT_PER_PROVIDER}s"
+        )
+
+    async def update_status(text: str):
+        if status_msg is None:
+            return
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=status_msg.message_id, text=text,
+            )
+        except Exception:
+            pass
+
+    async def animate(name: str, idx: int, stop_event: asyncio.Event):
+        elapsed = 0
+        while not stop_event.is_set() and elapsed < UPLOAD_TIMEOUT_PER_PROVIDER:
+            await update_status(build_status(name, idx, elapsed))
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            elapsed += 1
+
+    for idx, (name, fn) in enumerate(providers, start=1):
+        stop_event = asyncio.Event()
+        anim_task = asyncio.create_task(animate(name, idx, stop_event))
+
+        try:
+            url = await asyncio.wait_for(
+                fn(file_bytes, filename),
+                timeout=UPLOAD_TIMEOUT_PER_PROVIDER,
+            )
+            stop_event.set()
+            try:
+                await anim_task
+            except Exception:
+                pass
+
+            logger.info(f"✅ Image hébergée sur {name} : {url}")
+            await update_status(
+                f"✅ Hébergée sur {name} !\n\n"
+                f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}"
+            )
+            await asyncio.sleep(1.2)
+
+            if status_msg is not None:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+                except Exception:
+                    pass
+            return url
+
+        except asyncio.TimeoutError:
+            stop_event.set()
+            try:
+                await anim_task
+            except Exception:
+                pass
+            err = f"timeout {UPLOAD_TIMEOUT_PER_PROVIDER}s"
+            errors.append(f"{name}: {err}")
+            logger.warning(f"⏱️ {name} timeout, bascule au suivant")
+
+            if idx < total:
+                next_name = providers[idx][0]
+                await update_status(
+                    f"⏱️ {name} a dépassé {UPLOAD_TIMEOUT_PER_PROVIDER}s\n\n"
+                    f"🔄 Bascule vers {next_name}..."
+                )
+                await asyncio.sleep(0.8)
+            else:
+                await update_status(f"⏱️ {name} a dépassé {UPLOAD_TIMEOUT_PER_PROVIDER}s (dernier)")
+
+        except Exception as e:
+            stop_event.set()
+            try:
+                await anim_task
+            except Exception:
+                pass
+            errors.append(f"{name}: {e}")
+            logger.warning(f"❌ {name} échoué ({e}), bascule au suivant")
+
+            if idx < total:
+                next_name = providers[idx][0]
+                await update_status(
+                    f"❌ {name} a échoué\n\n"
+                    f"🔄 Bascule vers {next_name}..."
+                )
+                await asyncio.sleep(0.8)
+            else:
+                await update_status(f"❌ {name} a échoué (dernier)")
+
+    if status_msg is not None:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        except Exception:
+            pass
+
+    raise Exception("Tous les hébergeurs ont échoué : " + " | ".join(errors))
 
 
 # --- HANDLERS ---
@@ -1481,7 +1676,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "↩️ <b>ANNULER DERNIER</b> — annule le dernier résultat\n"
         "🔄 <b>RECOMMENCER CETTE SESSION</b> — vide une sous-session VIP\n\n"
         "📢 <b>DIFFUSION</b> supporte : texte, photo, vidéo, note vidéo (cercle)\n"
-        "👥 <b>ABONNÉS</b> propose : VIP / NON VIP / TOUS"
+        "👥 <b>CIBLES ABONNÉS</b> : VIP (dans canal VIP) / NON VIP / TOUS ABONNÉS"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -1795,8 +1990,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await clear_last_transient(context)
 
-    # --- Navigation ---
-
     if data == "confirm_resetall":
         context.user_data['history'] = []
         context.user_data['vip_history'] = empty_vip_history()
@@ -1849,8 +2042,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "btn_vip_rapport":
         await send_vip_rapport_action(update, context)
         return
-
-    # --- Choix cible diffusion auto ---
 
     if data == "setbcast_none" or data == "setbcast_all" or data.startswith("setbcast_target_"):
         if data == "setbcast_none":
@@ -1967,8 +2158,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_photo(chat_id=chat_id, photo=buf, caption="📈 Performance par jour")
         return
 
-    # --- Diffusion stats ---
-
     if data.startswith("statdiff_"):
         content = context.user_data.get('last_broadcast')
         if not content:
@@ -1977,7 +2166,11 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if data == "statdiff_all":
             destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
-        elif data == "statdiff_subscribers":
+        elif data == "statdiff_vip_only":
+            destinations = await get_subscriber_targets(context, 'vip_only')
+        elif data == "statdiff_non_vip_only":
+            destinations = await get_subscriber_targets(context, 'non_vip_only')
+        elif data == "statdiff_all_subscribers":
             destinations = await get_subscriber_targets(context, 'all')
         else:
             idx = int(data.replace("statdiff_target_", ""))
@@ -2005,52 +2198,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # --- Sondage ---
-
     if data == "polltarget_cancel":
         context.user_data['poll_draft'] = None
         await send_transient(context, chat_id, text="Sondage annulé.")
         return
 
-    if data == "polltarget_subscribers":
-        await send_transient(
-            context, chat_id,
-            text="👥 À quels abonnés envoyer le sondage ?",
-            reply_markup=get_subscribers_submenu_keyboard("pollsub", "polltarget_cancel"),
-        )
-        return
-
-    if data in ("pollsub_all_subscribers", "pollsub_vip_only", "pollsub_non_vip_only"):
-        poll_draft = context.user_data.get('poll_draft')
-        if not poll_draft or not poll_draft.get('question'):
-            await send_transient(context, chat_id, text="Rien à envoyer.")
-            return
-
-        if data == "pollsub_all_subscribers":
-            destinations = await get_subscriber_targets(context, 'all')
-        elif data == "pollsub_vip_only":
-            destinations = await get_subscriber_targets(context, 'vip_only')
-        else:
-            destinations = await get_subscriber_targets(context, 'non_vip_only')
-
-        sent, failed = 0, 0
-        for dest, dm_topic_id in destinations:
-            try:
-                extra = {'direct_messages_topic_id': dm_topic_id} if dm_topic_id is not None else {}
-                await context.bot.send_poll(
-                    chat_id=dest, question=poll_draft['question'],
-                    options=poll_draft['options'], **extra,
-                )
-                sent += 1
-            except Exception as e:
-                logger.warning(f"Échec d'envoi du sondage vers {dest} : {e}")
-                failed += 1
-
-        context.user_data['poll_draft'] = None
-        await send_transient(context, chat_id, text=f"📊 Sondage envoyé : {sent} réussi(s), {failed} échec(s).")
-        return
-
-    if data == "polltarget_all" or data.startswith("polltarget_idx_"):
+    if data == "polltarget_all" or data == "polltarget_vip_only" or data == "polltarget_non_vip_only" or data == "polltarget_all_subscribers" or data.startswith("polltarget_target_"):
         poll_draft = context.user_data.get('poll_draft')
         if not poll_draft or not poll_draft.get('question'):
             await send_transient(context, chat_id, text="Rien à envoyer.")
@@ -2058,8 +2211,14 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if data == "polltarget_all":
             destinations = [(normalize_broadcast_target(t), None) for t in BROADCAST_TARGETS]
+        elif data == "polltarget_vip_only":
+            destinations = await get_subscriber_targets(context, 'vip_only')
+        elif data == "polltarget_non_vip_only":
+            destinations = await get_subscriber_targets(context, 'non_vip_only')
+        elif data == "polltarget_all_subscribers":
+            destinations = await get_subscriber_targets(context, 'all')
         else:
-            idx = int(data.replace("polltarget_idx_", ""))
+            idx = int(data.replace("polltarget_target_", ""))
             if idx < 0 or idx >= len(BROADCAST_TARGETS):
                 await send_transient(context, chat_id, text="Cible invalide.")
                 return
@@ -2082,8 +2241,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_transient(context, chat_id, text=f"📊 Sondage envoyé : {sent} réussi(s), {failed} échec(s).")
         return
 
-    # --- Diffusion libre ---
-
     if data == "btn_diffusion_menu":
         await send_transient(
             context, chat_id,
@@ -2098,42 +2255,15 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(chat_id, context)
         return
 
-    if data == "diffchoice_subscribers":
-        await send_transient(
-            context, chat_id,
-            text="👥 À quels abonnés envoyer ?",
-            reply_markup=get_subscribers_submenu_keyboard("diffsub", "diffchoice_cancel"),
-        )
-        return
-
-    if data in ("diffsub_all_subscribers", "diffsub_vip_only", "diffsub_non_vip_only"):
-        if data == "diffsub_all_subscribers":
-            target_value = "subscribers_all"
-        elif data == "diffsub_vip_only":
-            target_value = "subscribers_vip"
-        else:
-            target_value = "subscribers_non_vip"
-
-        context.user_data['diffusion_draft'] = {
-            'target': target_value,
-            'step': 'content',
-            'text': None,
-            'photo_file_id': None,
-            'video_file_id': None,
-            'video_note_file_id': None,
-            'image_url': None,
-            'buttons': [],
-            'options': dict(DEFAULT_DIFFUSION_OPTIONS),
-        }
-        await send_transient(
-            context, chat_id,
-            text="✍️ Envoie le texte et/ou la photo/vidéo de ta publication :",
-        )
-        return
-
-    if data == "diffchoice_all" or data.startswith("diffchoice_target_"):
+    if data == "diffchoice_all" or data == "diffchoice_vip_only" or data == "diffchoice_non_vip_only" or data == "diffchoice_all_subscribers" or data.startswith("diffchoice_target_"):
         if data == "diffchoice_all":
             target_value = "all"
+        elif data == "diffchoice_vip_only":
+            target_value = "subscribers_vip"
+        elif data == "diffchoice_non_vip_only":
+            target_value = "subscribers_non_vip"
+        elif data == "diffchoice_all_subscribers":
+            target_value = "subscribers_all"
         else:
             idx = int(data.replace("diffchoice_target_", ""))
             if idx < 0 or idx >= len(BROADCAST_TARGETS):
@@ -2157,8 +2287,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             text="✍️ Envoie le texte et/ou la photo/vidéo de ta publication :",
         )
         return
-
-    # --- Extras de diffusion ---
 
     if data == "diffextra_photo":
         draft = context.user_data.get('diffusion_draft')
@@ -2470,8 +2598,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_transient(context, chat_id, text=text, reply_markup=reply_markup)
         return
 
-    # --- Diffusion manuelle ---
-
     if data == "btn_broadcast_menu":
         content = context.user_data.get('last_broadcast')
         if not content:
@@ -2529,8 +2655,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # --- Résultats ---
-
     _win_emoji = emojify(context, "✅")
     win_map = {
         "res_mg0": (f"{_win_emoji}<b>GAIN DIRECT</b>{_win_emoji}", "mg0"),
@@ -2545,9 +2669,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         record_result(context, result_key)
 
         last_asset = context.user_data.get('last_asset', None)
-
         image_path = get_specific_jpeg_only(DIR_WIN, last_asset)
-
         reply_markup = get_vip_result_keyboard() if mode == 'vip' else get_signal_keyboard()
 
         sent_message = await send_photo_safe(
@@ -2575,7 +2697,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         _lose_emoji = emojify(context, "❌")
         caption_text = f"{_lose_emoji}<b>PERDU</b>{_lose_emoji}"
         image_path = get_random_jpeg(DIR_LOSE)
-
         reply_markup = get_vip_result_keyboard() if mode == 'vip' else get_signal_keyboard()
 
         sent_message = await send_photo_safe(
@@ -2640,18 +2761,28 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
             file_id = message.photo[-1].file_id
             tg_file = await context.bot.get_file(file_id)
             file_bytes = bytes(await tg_file.download_as_bytearray())
-            draft['image_url'] = await upload_to_catbox(file_bytes)
+
+            image_url = await upload_with_progress_display(
+                context, chat_id, file_bytes,
+            )
+
+            draft['image_url'] = image_url
             draft['step'] = 'extras'
+            provider = image_url.split('/')[2] if '/' in image_url else 'inconnu'
             await send_transient(
                 context, chat_id,
-                text="✅ Photo hébergée avec succès. Que veux-tu faire d'autre ?",
+                text=f"✅ Photo hébergée sur {provider}. Que veux-tu faire d'autre ?",
                 reply_markup=get_diffusion_extras_keyboard(),
             )
         except Exception as e:
             logger.warning(f"Échec d'hébergement de l'image pour diffusion : {e}")
             await send_transient(
                 context, chat_id,
-                text=f"❌ Échec de l'hébergement de la photo : {e}",
+                text=(
+                    f"❌ Échec de l'hébergement de la photo.\n\n"
+                    f"Détail : {e}\n\n"
+                    f"Essaie à nouveau ou vérifie ta connexion."
+                ),
                 reply_markup=get_diffusion_extras_keyboard(),
             )
         return
@@ -2679,11 +2810,6 @@ async def handle_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Gère les vidéos classiques.
-    - Si on attend une note vidéo (step == 'awaiting_videonote') → délègue à handle_video_note (conversion).
-    - Sinon, comportement normal (diffusion vidéo classique).
-    """
     message = update.message
     if message is None or not message.video:
         return
@@ -2694,12 +2820,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     draft = context.user_data.get('diffusion_draft')
 
-    # Si on attend une note vidéo → conversion
     if draft and draft.get('step') == 'awaiting_videonote':
         await handle_video_note(update, context)
         return
 
-    # Diffusion vidéo classique
     if draft and draft.get('step') == 'content':
         draft['video_file_id'] = message.video.file_id
         if message.caption_html:
@@ -2731,12 +2855,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Gère les notes vidéo (cercles) :
-    - Si l'admin envoie une VRAIE note vidéo → utilisation directe.
-    - Si l'admin envoie une VIDÉO NORMALE → conversion auto via FFmpeg.
-    - Si l'admin envoie un DOCUMENT vidéo → conversion auto aussi.
-    """
     message = update.message
     if message is None:
         return
@@ -2762,7 +2880,6 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not draft:
         return
 
-    # Cas 1 : composition initiale
     if draft.get('step') == 'content':
         if already_note:
             draft['video_note_file_id'] = file_id
@@ -2802,7 +2919,6 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
         return
 
-    # Cas 2 : on attend spécifiquement une note vidéo
     if draft.get('step') == 'awaiting_videonote':
         if already_note:
             draft['video_note_file_id'] = file_id
@@ -2844,7 +2960,6 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Relais des messages texte + gestion étapes de composition texte."""
     message = update.message
     if message is None or not message.text:
         return
@@ -2853,7 +2968,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
     incoming_text = message.text.strip()
     logger.info(f"Message reçu de {chat_id} (admin={is_admin(chat_id)}) : {incoming_text!r}")
 
-    # --- Cas -2 : texte attendu après média ---
     if is_admin(chat_id):
         draft = context.user_data.get('diffusion_draft')
         if draft and draft.get('step') == 'awaiting_content_text':
@@ -2871,7 +2985,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-    # --- Cas -1 : raccourcis clavier ---
     quick_action = ADMIN_QUICK_ACTIONS.get(incoming_text)
     if quick_action is None:
         simplified = re.sub(r'[^\w]', '', incoming_text).lower()
@@ -2914,7 +3027,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             )
         return
 
-    # --- Cas -0.5 : composition sondage ---
     if is_admin(chat_id):
         poll_draft = context.user_data.get('poll_draft')
         if poll_draft and poll_draft.get('step') == 'content':
@@ -2935,7 +3047,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-    # --- Cas 0 : composition diffusion ---
     if is_admin(chat_id):
         draft = context.user_data.get('diffusion_draft')
         if draft:
@@ -3000,7 +3111,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 return
 
-    # --- Cas 1 : groupe de support (topics) ---
     if SUPPORT_GROUP_ID is not None and chat_id == SUPPORT_GROUP_ID:
         thread_id = message.message_thread_id
         if thread_id is None:
@@ -3026,7 +3136,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
             await message.reply_text(f"❌ Échec de l'envoi : {e}")
         return
 
-    # --- Cas 2 : admin écrit en privé au bot (reply) ---
     if is_admin(chat_id):
         reply_to = message.reply_to_message
         if reply_to:
@@ -3042,7 +3151,6 @@ async def relay_incoming_message(update: Update, context: ContextTypes.DEFAULT_T
                 return
         return
 
-    # --- Cas 3 : visiteur ---
     if is_blocked(context, chat_id):
         return
 
@@ -3131,7 +3239,6 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def is_rate_limited(context: ContextTypes.DEFAULT_TYPE, visitor_key: str) -> bool:
-    """Rate limiting en mémoire volatile (non persistée)."""
     now_ts = datetime.now(TZ).timestamp()
     cache = context.application.bot_data.setdefault('_rate_limit_cache', {})
     timestamps = cache.setdefault(visitor_key, [])
@@ -3233,11 +3340,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def on_startup(app):
-    """Nettoyage des caches volatils au démarrage + vérif FFmpeg."""
     app.bot_data['_rate_limit_cache'] = {}
     if not isinstance(app.bot_data.get('relay_map'), OrderedDict):
         app.bot_data['relay_map'] = OrderedDict(app.bot_data.get('relay_map', {}))
-    logger.info("Caches volatils initialisés.")
+
+    # Détection OS + chemins
+    logger.info(f"Système détecté : {SYSTEM_OS} (Python {platform.python_version()})")
+    if SYSTEM_OS == "Darwin":
+        logger.info(f"💻 macOS : PATH enrichi pour Homebrew/usr/local")
 
     # Vérification FFmpeg
     try:
@@ -3250,14 +3360,27 @@ async def on_startup(app):
         logger.warning(
             f"⚠️ FFmpeg introuvable ou non fonctionnel ({e}). "
             f"La conversion vidéo → note vidéo sera indisponible. "
-            f"Installe-le : pkg install ffmpeg (Termux) / apt install ffmpeg (Linux) / "
-            f"brew install ffmpeg (macOS) / ffmpeg.exe (Windows)."
+            f"Installe-le :\n"
+            f"  - macOS : brew install ffmpeg (ou téléchargement manuel dans /usr/local/bin)\n"
+            f"  - Termux : pkg install ffmpeg\n"
+            f"  - Linux : sudo apt install ffmpeg\n"
+            f"  - Windows : ffmpeg.exe dans le dossier du bot"
         )
+
+    logger.info(
+        f"🌐 Cascade d'hébergement : Catbox → 0x0.st → Freeimage.host "
+        f"(timeout {UPLOAD_TIMEOUT_PER_PROVIDER}s par hébergeur)"
+    )
+    logger.info("Caches volatils initialisés.")
 
 
 def main():
     if not TOKEN:
         raise ValueError("Le TELEGRAM_TOKEN n'a pas été trouvé. Vérifiez votre fichier .env")
+
+    # macOS : suppression des warnings asyncio au Ctrl+C
+    if SYSTEM_OS == "Darwin":
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
 
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
 
@@ -3282,7 +3405,6 @@ def main():
         .build()
     )
 
-    # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -3337,7 +3459,6 @@ def main():
             )
             logger.info(f"Rappel automatique de canal programmé (après {CHANNEL_REMINDER_DAYS} jour(s)).")
 
-    logger.info(f"Système détecté : {SYSTEM_OS} (Python {platform.python_version()})")
     logger.info(f"Persistance activée : {PERSISTENCE_FILE}")
     if ALLOWED_CHAT_IDS:
         logger.info(f"Accès restreint à {len(ALLOWED_CHAT_IDS)} chat_id(s).")
